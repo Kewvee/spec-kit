@@ -105,6 +105,11 @@ def parse_scenarios(spec_text: str, number: str) -> list[Scenario]:
     return scenarios
 
 
+def user_stories(spec_text: str) -> list[int]:
+    """Numbers of the ``### User Story N`` sections, in order."""
+    return [int(m.group(1)) for line in spec_text.splitlines() if (m := STORY_RE.match(line))]
+
+
 def clarification_markers(spec_text: str) -> int:
     return spec_text.count(CLARIFY_MARKER)
 

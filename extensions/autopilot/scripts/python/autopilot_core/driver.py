@@ -10,8 +10,11 @@ on plain code runs the show, as the design memo asks:
                   ``autopilot-epic`` workflow there, merge passed epics one
                   at a time into an integration branch, re-verify after each
                   merge, block dependents of epics that did not make it
+* ``approve``     record the product owner's verdict on a gate (the plan, the
+                  final merge); ``drive`` and ``land`` refuse without it
 * ``land``        after the human approves, merge the integration branch
-                  into the base branch
+                  into the base branch (verifying the combination first when
+                  the base branch moved meanwhile)
 
 Caps: parallel pipes, wall time for the run and per pipe, agent-call budget
 (a cost proxy: integration CLIs do not report spend uniformly), attempts.
@@ -30,12 +33,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import secrets as _secrets
+
 from . import dag as dag_mod
 from . import team
-from .config import configured_checks
+from .config import configured_checks, write_snapshot
 from .gate import LOOP_END, checks_only
 from .util import (
     GitError,
+    LockHeld,
+    ProcessLock,
     append_jsonl,
     commit_all,
     dirty_paths,
@@ -43,16 +50,26 @@ from .util import (
     git,
     git_ok,
     identity_args,
-    is_clean,
+    kill_group,
     now_iso,
+    pid_alive,
     read_json,
+    read_json_lenient,
+    record_synced,
     run,
+    runtime_paths_between,
     write_json,
 )
 
 EPIC_WORKFLOW = "autopilot-epic"
 FINAL = {"merged", "failed", "escalated", "blocked"}
 SYNC_EXCLUDES = (".specify/autopilot", ".specify/workflows/runs", ".specify/feature.json")
+SETUP_MARKER = "setup.done"
+WORKER_FILE = "worker.json"
+GATES = ("plan", "land")
+# Charged for an attempt that crashed before its pipe recorded any work
+# (specify, plus the spec consult that may follow it).
+UNRECORDED_ATTEMPT_CALLS = 3
 
 
 class DriverError(RuntimeError):
@@ -81,45 +98,17 @@ def log(root: Path, event: str, **fields: Any) -> None:
     print(f"[autopilot] {event} {detail}".rstrip(), file=sys.stderr, flush=True)
 
 
-def _lock_path(root: Path) -> Path:
-    return ensure_state_dir(root) / "drive.lock"
-
-
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        # os.kill(pid, 0) is not a liveness probe on Windows; ask tasklist.
-        out = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], Path.cwd()).stdout
-        return str(pid) in out
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+def _lock(root: Path) -> ProcessLock:
+    return ProcessLock(ensure_state_dir(root) / "drive.lock")
 
 
 def drive_owner(root: Path) -> dict[str, Any] | None:
-    """The live drive holding the lock, or None (a stale lock is ignored)."""
-    lock = read_json(_lock_path(root))
-    if not isinstance(lock, dict) or not _pid_alive(int(lock.get("pid", 0))):
-        return None
-    return lock
+    """The live drive holding the lock, or None (the OS drops a crashed holder's lock)."""
+    return _lock(root).owner()
 
 
-def _acquire_lock(root: Path) -> None:
-    owner = drive_owner(root)
-    if owner is not None:
-        raise DriverError(f"a drive is already running (pid {owner['pid']}, since {owner['started_at']})")
-    write_json(_lock_path(root), {"pid": os.getpid(), "started_at": now_iso()})
-
-
-def _release_lock(root: Path) -> None:
-    lock = read_json(_lock_path(root))
-    if isinstance(lock, dict) and lock.get("pid") == os.getpid():
-        _lock_path(root).unlink(missing_ok=True)
+def run_id(state: dict[str, Any]) -> str:
+    return state.get("run_id") or ("r" + str(state.get("created_at", ""))[:10].replace("-", ""))
 
 
 def worst_case_calls(config: dict[str, Any]) -> int:
@@ -192,16 +181,24 @@ def plan_check(root: Path, config: dict[str, Any], reset: bool = False) -> tuple
     except dag_mod.PlanError as exc:
         return 1, {"ok": False, "problems": exc.problems}
 
-    existing = read_json(state_dir / "state.json")
+    existing = read_json_lenient(state_dir / "state.json")
+    if existing and existing.get("landed_commit"):
+        return 1, {"ok": False, "problems": [
+            "the previous run is landed; start the next one with `autopilot.py new-run` (archives it), "
+            "then plan fresh epics with /speckit.autopilot.epics"
+        ]}
+    if existing and drive_owner(root) is not None:
+        return 1, {"ok": False, "problems": ["a drive is running; stop it before re-planning"]}
     if existing and not reset and any(e["status"] != "pending" for e in existing["epics"].values()):
         return 1, {"ok": False, "problems": [
             "an autopilot run is already in progress or finished; re-run with --reset to discard its state "
-            "(branches and worktrees are left in place)"
+            "(its branches and worktrees are left in place; the new plan gets fresh ones)"
         ]}
 
     notes = dag_mod.serialise_overlaps(epics)
     feature_dirs = dag_mod.assign_feature_dirs(epics, root / "specs")
     run_cfg = config["run"]
+    new_run_id = f"r{datetime.now(timezone.utc):%m%d}-{_secrets.token_hex(2)}"
     base_branch = run_cfg["base_branch"] or git(root, "branch", "--show-current")
     if not base_branch:
         return 1, {"ok": False, "problems": ["HEAD is detached; check out the base branch or set run.base_branch"]}
@@ -209,6 +206,8 @@ def plan_check(root: Path, config: dict[str, Any], reset: bool = False) -> tuple
     worktree_root = Path(run_cfg["worktree_root"]).expanduser() if run_cfg["worktree_root"] else _default_worktree_root(root)
     if not worktree_root.is_absolute():
         worktree_root = (root / worktree_root).resolve()
+    worktree_root = worktree_root / new_run_id
+    prefix = run_cfg["branch_prefix"].replace("{run}", new_run_id)
 
     problems = []
     program = state_dir / "program.md"
@@ -220,9 +219,12 @@ def plan_check(root: Path, config: dict[str, Any], reset: bool = False) -> tuple
     epic_states: dict[str, dict[str, Any]] = {}
     for epic in epics:
         dir_name = Path(feature_dirs[epic.id]).name
-        branch = f"{run_cfg['branch_prefix']}{dir_name}"
-        if git_ok(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}") and not reset:
-            problems.append(f"branch {branch} already exists")
+        branch = f"{prefix}{dir_name}"
+        # Never reuse another run's branch or worktree: it may hold old work or old pipe state.
+        if git_ok(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+            problems.append(f"branch {branch} already exists; put {{run}} in run.branch_prefix or delete it")
+        if (worktree_root / dir_name).exists():
+            problems.append(f"worktree path {worktree_root / dir_name} already exists")
         epic_states[epic.id] = {
             "id": epic.id,
             "slug": epic.slug,
@@ -246,15 +248,17 @@ def plan_check(root: Path, config: dict[str, Any], reset: bool = False) -> tuple
             "finished_at": None,
             "merged_commit": None,
         }
-    integration_branch = run_cfg["integration_branch"]
-    if git_ok(root, "show-ref", "--verify", "--quiet", f"refs/heads/{integration_branch}") and not reset:
-        problems.append(f"integration branch {integration_branch} already exists; delete it or pass --reset")
+    integration_branch = run_cfg["integration_branch"].replace("{run}", new_run_id)
+    if git_ok(root, "show-ref", "--verify", "--quiet", f"refs/heads/{integration_branch}"):
+        problems.append(f"integration branch {integration_branch} already exists; put {{run}} in "
+                        "run.integration_branch or delete it")
     if problems:
         return 1, {"ok": False, "problems": problems}
 
     order = [epic.id for epic in dag_mod.topological_order(epics)]
     state = {
         "schema": 1,
+        "run_id": new_run_id,
         "created_at": now_iso(),
         "started_at": None,
         "base_branch": base_branch,
@@ -268,11 +272,14 @@ def plan_check(root: Path, config: dict[str, Any], reset: bool = False) -> tuple
         "epics": epic_states,
     }
     save_state(root, state)
+    (state_dir / "approvals.json").unlink(missing_ok=True)  # a new plan needs a new approval
     (state_dir / "dag.md").write_text(
         render_dag(state, dag_mod.waves(epics), program.read_text(encoding="utf-8")), encoding="utf-8"
     )
-    return 0, {"ok": True, "epics": len(order), "waves": dag_mod.waves(epics), "notes": notes,
-               "dag": str((state_dir / "dag.md").relative_to(root))}
+    log(root, "planned", run=new_run_id, epics=len(order))
+    return 0, {"ok": True, "run_id": new_run_id, "epics": len(order), "waves": dag_mod.waves(epics),
+               "notes": notes, "dag": str((state_dir / "dag.md").relative_to(root)),
+               "approve_with": f"approve plan {new_run_id}"}
 
 
 def render_dag(state: dict[str, Any], wave_list: list[list[str]], program: str = "") -> str:
@@ -280,7 +287,7 @@ def render_dag(state: dict[str, Any], wave_list: list[list[str]], program: str =
     lines = [
         "# Autopilot epic plan",
         "",
-        f"Base: `{state['base_branch']}` @ `{state['base_commit'][:12]}` → integration branch "
+        f"Run `{run_id(state)}`. Base: `{state['base_branch']}` @ `{state['base_commit'][:12]}` → integration branch "
         f"`{state['integration_branch']}`. Worktrees under `{state['worktree_root']}`.",
         "",
         "Approve to let the pipes run unattended. Nothing reaches the base branch until the final merge gate.",
@@ -319,8 +326,12 @@ def render_dag(state: dict[str, Any], wave_list: list[list[str]], program: str =
 
 
 def _sync_untracked(root: Path, worktree: Path, paths: list[str]) -> int:
-    """Copy agent/Spec Kit files the worktree lacks (untracked or ignored in git)."""
-    copied = 0
+    """Copy agent/Spec Kit files the worktree lacks (untracked or ignored in git).
+
+    The copied files are recorded so that exactly these, and not new files an
+    epic creates under the same directories, stay out of the epic's commits.
+    """
+    copied: set[str] = set()
     for rel in paths:
         source = root / rel
         if not source.exists():
@@ -334,8 +345,21 @@ def _sync_untracked(root: Path, worktree: Path, paths: list[str]) -> int:
             if not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
-                copied += 1
-    return copied
+                copied.add(relative)
+    record_synced(worktree, copied)
+    return len(copied)
+
+
+def _setup_done(path: Path) -> bool:
+    return (path / ".specify" / "autopilot" / SETUP_MARKER).is_file()
+
+
+def _initialise_worktree(root: Path, path: Path, config: dict[str, Any], label: str) -> None:
+    """Sync setup files and run ``run.setup``; mark success, so a failed setup is retried."""
+    _sync_untracked(root, path, config["run"]["sync_paths"])
+    ensure_state_dir(path)
+    _setup_worktree(root, path, config, label)
+    (path / ".specify" / "autopilot" / SETUP_MARKER).write_text(now_iso() + "\n", encoding="utf-8")
 
 
 def ensure_integration(root: Path, state: dict[str, Any], config: dict[str, Any]) -> Path:
@@ -346,8 +370,8 @@ def ensure_integration(root: Path, state: dict[str, Any], config: dict[str, Any]
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         git(root, "worktree", "add", "-q", str(path), branch)
-        _sync_untracked(root, path, config["run"]["sync_paths"])
-        _setup_worktree(root, path, config, "integration")
+    if not _setup_done(path):
+        _initialise_worktree(root, path, config, "integration")
     return path
 
 
@@ -370,9 +394,8 @@ def prepare_epic_worktree(root: Path, state: dict[str, Any], epic: dict[str, Any
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         git(root, "worktree", "add", "-q", str(path), epic["branch"])
-        _sync_untracked(root, path, config["run"]["sync_paths"])
-        ensure_state_dir(path)
-        _setup_worktree(root, path, config, epic["id"])
+    if not _setup_done(path):
+        _initialise_worktree(root, path, config, epic["id"])
 
 
 # ── pipes ────────────────────────────────────────────────────────────────────
@@ -398,23 +421,49 @@ def _latest_run(worktree: Path) -> tuple[str | None, str | None]:
     return (best[1], best[2]) if best else (None, None)
 
 
+def _runs_in(pid: int, worktree: Path) -> bool:
+    """Guard against PID reuse: on Linux, check the process still works in this worktree."""
+    cwd = Path(f"/proc/{pid}/cwd")
+    if not Path("/proc").is_dir():
+        return True
+    try:
+        return cwd.resolve() == worktree.resolve()
+    except OSError:
+        return False
+
+
+def _stop_orphaned_worker(worktree: Path) -> None:
+    """A pipe process left over from a drive that died: stop it before relaunching.
+
+    Only the lock holder launches pipes, so a recorded worker that is still alive
+    belongs to a dead drive and would keep editing this worktree.
+    """
+    worker = read_json_lenient(worktree / ".specify" / "autopilot" / WORKER_FILE)
+    if isinstance(worker, dict) and isinstance(worker.get("pid"), int) and worker["pid"] != os.getpid():
+        if pid_alive(worker["pid"]) and _runs_in(worker["pid"], worktree):
+            kill_group(worker["pid"])
+    (worktree / ".specify" / "autopilot" / WORKER_FILE).unlink(missing_ok=True)
+
+
 def run_pipe(root: Path, epic: dict[str, Any], config: dict[str, Any], integration: str) -> dict[str, Any]:
     """Run (or resume) one epic's workflow in its worktree. Thread-safe: touches only its worktree."""
     worktree = Path(epic["worktree"])
     existing = _pipe_state(epic)
     if existing and existing.get("status") in LOOP_END:
         return {"pipe": existing, "exit_code": 0, "run_id": epic.get("run_id"), "run_status": "completed", "skipped": True}
-    run_id, run_status = _latest_run(worktree)
+    _stop_orphaned_worker(worktree)
+    workflow_run, run_status = _latest_run(worktree)
     specify = config["run"]["specify_command"]
     feature = worktree / epic["feature_dir"]
-    if run_id and run_status not in ("completed", "aborted") and not epic.get("fresh_build"):
-        # Interrupted or crashed mid-run: the engine replays completed steps and
-        # retries the unfinished one.
-        command = [specify, "workflow", "resume", run_id, "--json"]
+    if workflow_run and run_status in ("paused", "failed") and not epic.get("fresh_build"):
+        # The engine replays completed steps and retries the unfinished one.
+        command = [specify, "workflow", "resume", workflow_run, "--json"]
     else:
-        # A new run, resuming at the first missing artifact so /speckit.specify
-        # never overwrites an existing spec (after a reset, an answered question,
-        # or a crash before the run was recorded).
+        # A new run (also replacing a checkpoint left "running" by a killed worker,
+        # which the engine cannot resume), starting at the first missing artifact
+        # so the work already on disk is kept.
+        # /speckit.specify never overwrites an existing spec (after a reset, an
+        # answered question, or a crash before the run was recorded).
         if (feature / "tasks.md").is_file():
             phase = "build"
         elif (feature / "spec.md").is_file():
@@ -428,7 +477,12 @@ def run_pipe(root: Path, epic: dict[str, Any], config: dict[str, Any], integrati
         for key in ("reviewer_model", "lead_model"):
             if config["run"][key]:
                 command += ["--input", f"{key}={config['run'][key]}"]
+    snapshot = write_snapshot(config, ensure_state_dir(root) / "run-config.json")
     env = {
+        # The project is this worktree, whatever the caller's environment says.
+        "SPECIFY_INIT_DIR": str(worktree),
+        # Every pipe uses the conductor's current settings, not a stale worktree copy.
+        "AUTOPILOT_CONFIG": str(snapshot),
         "SPECIFY_FEATURE_DIRECTORY": epic["feature_dir"],
         "SPECIFY_FEATURE": epic["branch"],
         "GIT_BRANCH_NAME": epic["branch"],
@@ -437,7 +491,13 @@ def run_pipe(root: Path, epic: dict[str, Any], config: dict[str, Any], integrati
         # The lead's handbook and the shared decision log live in the main checkout.
         "AUTOPILOT_ROOT": str(root),
     }
-    result = run(command, worktree, timeout=config["pipe"]["timeout_minutes"] * 60, env=env)
+    worker_file = ensure_state_dir(worktree) / WORKER_FILE
+
+    def started(pid: int) -> None:
+        write_json(worker_file, {"pid": pid, "started_at": now_iso(), "drive_pid": os.getpid()})
+
+    result = run(command, worktree, timeout=config["pipe"]["timeout_minutes"] * 60, env=env, on_start=started)
+    worker_file.unlink(missing_ok=True)
     logs = ensure_state_dir(root) / "logs"
     logs.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
@@ -461,12 +521,15 @@ def run_pipe(root: Path, epic: dict[str, Any], config: dict[str, Any], integrati
         except json.JSONDecodeError:
             payload = {}
     latest_id, latest_status = _latest_run(worktree)
+    attempt_calls = (_pipe_state(epic) or {}).get("agent_calls")
     return {
         "pipe": _pipe_state(epic),
         "exit_code": result.returncode,
         "run_id": payload.get("run_id") or latest_id,
         "run_status": payload.get("status") or latest_status,
         "timed_out": result.returncode == -1,
+        "calls_before": (existing or {}).get("agent_calls", 0),
+        "calls_after": attempt_calls,
         "error": payload.get("error") or (result.stderr.strip()[-500:] if result.returncode else ""),
     }
 
@@ -483,6 +546,10 @@ def merge_epic(root: Path, state: dict[str, Any], epic: dict[str, Any], config: 
     """Merge one passed epic into the integration branch, re-verifying after."""
     integration = ensure_integration(root, state, config)
     worktree = Path(epic["worktree"])
+    leaked = runtime_paths_between(root, state["integration_branch"], epic["branch"])
+    if leaked:
+        return False, ("the epic branch commits checkout-local runtime files ("
+                       + ", ".join(leaked[:5]) + "); remove them from the branch and reset the epic")
     message = f"autopilot: merge {epic['id']} {epic['title']} ({epic['feature_dir']})"
     before = git(integration, "rev-parse", "HEAD")
 
@@ -494,7 +561,8 @@ def merge_epic(root: Path, state: dict[str, Any], epic: dict[str, Any], config: 
 
     if not attempt():
         # Rebase the epic onto the moved integration branch, re-verify it, retry once.
-        if not git_ok(worktree, *identity_args(worktree), "rebase", "-q", state["integration_branch"]):
+        # --autostash: checkout-local files (feature.json) may be modified in the worktree.
+        if not git_ok(worktree, *identity_args(worktree), "rebase", "-q", "--autostash", state["integration_branch"]):
             git(worktree, "rebase", "--abort", check=False)
             return False, f"merge conflict with {state['integration_branch']} and rebase failed; resolve in {worktree}"
         failing = _verify(worktree, config, epic["feature_dir"])
@@ -569,24 +637,108 @@ def _ready(state: dict[str, Any], epic: dict[str, Any]) -> bool:
     )
 
 
+# ── approvals ────────────────────────────────────────────────────────────────
+
+
+def _approvals_path(root: Path) -> Path:
+    return ensure_state_dir(root) / "approvals.json"
+
+
+def approval(root: Path, state: dict[str, Any], gate: str) -> dict[str, Any] | None:
+    """The recorded verdict on a gate for this run, or None."""
+    data = read_json_lenient(_approvals_path(root), {}) or {}
+    if not isinstance(data, dict) or data.get("run_id") != run_id(state):
+        return None
+    verdict = data.get(gate)
+    return verdict if isinstance(verdict, dict) else None
+
+
+def approved(root: Path, state: dict[str, Any], gate: str) -> bool:
+    verdict = approval(root, state, gate)
+    return bool(verdict and verdict.get("verdict") == "approved")
+
+
+def approve(
+    root: Path,
+    config: dict[str, Any],
+    gate: str,
+    *,
+    accept: bool,
+    by: str = "product owner",
+    via: str = "agent chat",
+    note: str = "",
+    expected_run: str = "",
+    cli: Path | None = None,
+    act: bool = True,
+) -> tuple[int, dict[str, Any]]:
+    """Record the product owner's verdict on a gate; on approval, act on it.
+
+    Approving the plan starts the drive (detached when ``cli`` is given);
+    approving the final merge lands. ``expected_run`` must match the current
+    run ID when given (chat approvals name the run, so an old message cannot
+    approve a new plan).
+    """
+    if gate not in GATES:
+        return 1, {"ok": False, "error": f"unknown gate {gate!r} (expected plan or land)"}
+    state = load_state(root)
+    current = run_id(state)
+    if expected_run and expected_run != current:
+        return 1, {"ok": False, "error": f"run {expected_run} is not the current run ({current})"}
+    status = run_status(root)
+    allowed = {"plan": {"awaiting-plan-approval"}, "land": {"awaiting-land", "finished-nothing-merged"}}[gate]
+    if status["stage"] not in allowed:
+        return 1, {"ok": False, "error": f"the {gate} gate is not open (stage: {status['stage']})"}
+    data = read_json_lenient(_approvals_path(root), {}) or {}
+    if not isinstance(data, dict) or data.get("run_id") != current:
+        data = {"run_id": current}
+    verdict = "approved" if accept else "rejected"
+    data[gate] = {"verdict": verdict, "by": by, "via": via, "note": note.strip(), "at": now_iso()}
+    write_json(_approvals_path(root), data)
+    log(root, verdict, gate=gate, run=current, via=via)
+    result: dict[str, Any] = {"ok": True, "gate": gate, "run_id": current, "verdict": verdict}
+    if not accept or not act:
+        return 0, result
+    if gate == "plan":
+        if cli is not None:
+            code, started = drive_detached(root, cli, "")
+            return code, {**result, "drive": started}
+        return 0, result
+    code, landed = land(root, config)
+    return code, {**result, "land": landed}
+
+
+# ── drive ────────────────────────────────────────────────────────────────────
+
+
 def drive(root: Path, config: dict[str, Any], integration: str = "", pipe_runner=run_pipe) -> tuple[int, dict[str, Any]]:
-    """Run the DAG to completion. Only one drive per checkout: a pid lock guards it."""
-    load_state(root)  # fail before locking when there is no plan
-    _acquire_lock(root)
+    """Run the DAG to completion. Only one drive per checkout: an OS-held lock guards it."""
+    state = load_state(root)  # fail before locking when there is no plan
+    if not approved(root, state, "plan"):
+        verdict = approval(root, state, "plan")
+        why = "rejected" if verdict else "not approved yet"
+        raise DriverError(f"the plan for run {run_id(state)} is {why}; the product owner approves it with "
+                          f"`autopilot.py approve plan` (or `approve plan {run_id(state)}` in the team chat)")
+    lock = _lock(root)
+    try:
+        lock.acquire()
+    except LockHeld as exc:
+        raise DriverError(f"a drive is already running (pid {exc.owner.get('pid')}, since {exc.owner.get('started_at')})") from exc
     try:
         return _drive(root, config, integration, pipe_runner)
     finally:
-        _release_lock(root)
+        lock.release()
 
 
 def drive_detached(root: Path, cli: Path, integration: str) -> tuple[int, dict[str, Any]]:
     """Start ``drive`` as a background process that outlives the calling agent's shell."""
     import subprocess
 
-    load_state(root)
+    state = load_state(root)
     owner = drive_owner(root)
     if owner is not None:
         return 0, {"started": False, "already_running": True, **owner}
+    if not approved(root, state, "plan"):
+        return 1, {"started": False, "error": f"the plan for run {run_id(state)} is not approved"}
     out_path = ensure_state_dir(root) / "drive.out"
     command = [sys.executable, str(cli), "drive"]
     if integration:
@@ -599,7 +751,7 @@ def drive_detached(root: Path, cli: Path, integration: str) -> tuple[int, dict[s
     with out_path.open("ab") as out:
         process = subprocess.Popen(command, stdout=out, **kwargs)
     # Give the child a moment to take the lock or fail fast (no plan, bad config).
-    for _ in range(20):
+    for _ in range(40):
         if drive_owner(root) is not None or process.poll() is not None:
             break
         time.sleep(0.25)
@@ -608,8 +760,21 @@ def drive_detached(root: Path, cli: Path, integration: str) -> tuple[int, dict[s
     return 0, {"started": True, "pid": process.pid, "output": str(out_path.relative_to(root))}
 
 
+STOP_REASON = "STOP file present"
+
+
 def stop_file(root: Path) -> Path:
     return root / ".specify" / "autopilot" / "STOP"
+
+
+def unstop(root: Path) -> dict[str, Any]:
+    """Withdraw a stop request; clear the matching halt when no drive is running."""
+    stop_file(root).unlink(missing_ok=True)
+    state = read_json_lenient(ensure_state_dir(root) / "state.json")
+    if isinstance(state, dict) and state.get("halted") == STOP_REASON and drive_owner(root) is None:
+        state.pop("halted", None)
+        save_state(root, state)
+    return {"stop_requested": False}
 
 
 def _drive(root: Path, config: dict[str, Any], integration: str, pipe_runner) -> tuple[int, dict[str, Any]]:
@@ -620,6 +785,9 @@ def _drive(root: Path, config: dict[str, Any], integration: str, pipe_runner) ->
     deadline = started.timestamp() + config["run"]["timeout_minutes"] * 60
     integration = integration if integration and integration != "auto" else config["run"]["integration"]
     ensure_integration(root, state, config)
+    # A new drive starts unhalted: an earlier STOP, deadline or budget halt is
+    # re-evaluated below against the current situation.
+    state.pop("halted", None)
     save_state(root, state)
     log(root, "drive", epics=len(state["order"]), max_parallel=config["run"]["max_parallel"])
 
@@ -632,8 +800,12 @@ def _drive(root: Path, config: dict[str, Any], integration: str, pipe_runner) ->
             _block_dependents(root, state)
             _resume_answered(root, state)
             if stop.exists():
-                halted = halted or "STOP file present"
-            elif time.time() > deadline:
+                halted = halted or STOP_REASON
+            elif halted == STOP_REASON:
+                halted = ""  # the stop request was withdrawn: start pipes again
+                state.pop("halted", None)
+                log(root, "resumed")
+            if not stop.exists() and time.time() > deadline:
                 halted = halted or f"run timeout ({config['run']['timeout_minutes']} min)"
             if not halted:
                 for epic_id in state["order"]:
@@ -644,8 +816,10 @@ def _drive(root: Path, config: dict[str, Any], integration: str, pipe_runner) ->
                         continue
                     cost = worst_case_calls(config)
                     if state["agent_calls_used"] + sum(reserved.values()) + cost > config["run"]["max_agent_calls"]:
-                        halted = f"agent-call budget ({config['run']['max_agent_calls']}) would be exceeded"
-                        break
+                        if not running:
+                            # Nothing running can release a reservation: the budget is spent.
+                            halted = f"agent-call budget ({config['run']['max_agent_calls']}) would be exceeded"
+                        break  # otherwise wait: a finishing pipe may use less than it reserved
                     try:
                         prepare_epic_worktree(root, state, epic, config)
                     except (GitError, DriverError, OSError) as exc:
@@ -693,9 +867,18 @@ def _settle(root: Path, state: dict[str, Any], epic: dict[str, Any], outcome: di
     epic.pop("fresh_build", None)
     epic["run_id"] = outcome.get("run_id") or epic.get("run_id")
     epic["iterations"] = pipe.get("iteration", epic["iterations"])
-    calls = pipe.get("agent_calls", 3 if outcome.get("exit_code") else 0)
-    state["agent_calls_used"] += max(0, calls - epic.get("agent_calls", 0))
-    epic["agent_calls"] = max(calls, epic.get("agent_calls", 0))
+    # Charge this attempt: what its pipe recorded, or a conservative amount when it
+    # crashed before recording anything (every attempt costs, retries included).
+    before = outcome.get("calls_before", epic.get("agent_calls", 0)) or 0
+    after = outcome.get("calls_after", pipe.get("agent_calls"))
+    if outcome.get("skipped"):
+        spent = 0
+    elif isinstance(after, int) and after > before:
+        spent = after - before
+    else:
+        spent = UNRECORDED_ATTEMPT_CALLS
+    state["agent_calls_used"] += spent
+    epic["agent_calls"] = epic.get("agent_calls", 0) + spent
     pipe_status = pipe.get("status")
     if pipe_status == "passed":
         try:
@@ -745,22 +928,33 @@ def run_status(root: Path) -> dict[str, Any]:
         return {"stage": "planned-unchecked" if has_plan else "no-plan", "drive_running": False}
     summary = status_summary(state)
     questions = human_questions(root)
+    halted = state.get("halted", "")
+    # A halt whose cause was lifted (the stop request withdrawn) is not an ending.
+    halt_stands = bool(halted) and not (halted == STOP_REASON and not stop_file(root).exists())
+    plan_verdict = approval(root, state, "plan")
+    land_verdict = approval(root, state, "land")
     if state.get("landed_commit"):
         stage = "landed"
+    elif land_verdict and land_verdict.get("verdict") == "rejected":
+        stage = "land-rejected"
+    elif plan_verdict and plan_verdict.get("verdict") == "rejected":
+        stage = "plan-rejected"
     elif owner is not None:
         stage = "driving"
     elif questions:
         stage = "awaiting-human"
-    elif summary["finished"] or state.get("halted"):
+    elif summary["finished"] or halt_stands:
         stage = "awaiting-land" if summary["counts"].get("merged") else "finished-nothing-merged"
     elif state["started_at"] is None:
-        stage = "awaiting-plan-approval"
+        stage = "awaiting-plan-approval" if not plan_verdict else "interrupted"
     else:
         stage = "interrupted"  # started, not finished, no live drive
     log_path = root / ".specify" / "autopilot" / "log.jsonl"
     recent = log_path.read_text(encoding="utf-8").splitlines()[-15:] if log_path.is_file() else []
     return {
         "stage": stage,
+        "run_id": run_id(state),
+        "approvals": {gate: approval(root, state, gate) for gate in GATES},
         "drive_running": owner is not None,
         "drive_pid": owner["pid"] if owner else None,
         "stop_requested": stop_file(root).exists(),
@@ -842,22 +1036,102 @@ def report(root: Path, config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
 
 def land(root: Path, config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Merge the integration branch into the base branch, after the product owner approved.
+
+    When the base branch moved since the run started, the combination of its new
+    tip and the integration branch never passed any gate: it is merged and
+    verified in a scratch worktree first, and the base branch only fast-forwards
+    to that verified commit.
+    """
     state = load_state(root)
+    if not approved(root, state, "land"):
+        return 1, {"landed": False, "reason": f"the final merge of run {run_id(state)} is not approved; the product "
+                   f"owner approves it with `autopilot.py approve land` (or `approve land {run_id(state)}` in chat)"}
+    if drive_owner(root) is not None:
+        return 1, {"landed": False, "reason": "a drive is still running"}
     merged = [e for e in state["epics"].values() if e["status"] == "merged"]
     if not merged:
         return 0, {"landed": False, "reason": "no merged epics"}
     current = git(root, "branch", "--show-current")
     if current != state["base_branch"]:
         return 1, {"landed": False, "reason": f"check out {state['base_branch']} first (on {current or 'detached HEAD'})"}
-    if not is_clean(root):
-        return 1, {"landed": False, "reason": "working tree has uncommitted changes"}
-    message = f"autopilot: land {len(merged)} epic(s): " + ", ".join(e["id"] for e in merged)
-    if not git_ok(root, *identity_args(root), "merge", "--no-ff", "-m", message, state["integration_branch"]):
-        git(root, "merge", "--abort", check=False)
-        return 1, {"landed": False, "reason": f"merge of {state['integration_branch']} conflicts; merge it by hand"}
+    # Untracked Spec Kit / agent setup is fine here too; git itself refuses real overwrites.
+    dirty = dirty_paths(root, config["run"]["sync_paths"])
+    if dirty:
+        return 1, {"landed": False, "reason": "working tree has uncommitted changes: " + ", ".join(dirty[:5])}
+    message = f"autopilot: land run {run_id(state)}, {len(merged)} epic(s): " + ", ".join(e["id"] for e in merged)
+    base_tip = git(root, "rev-parse", "HEAD")
+    integration = state["integration_branch"]
+    if git_ok(root, "merge-base", "--is-ancestor", base_tip, integration):
+        # The base has not moved past what the integration branch was verified on.
+        if not git_ok(root, *identity_args(root), "merge", "--no-ff", "-m", message, integration):
+            git(root, "merge", "--abort", check=False)
+            return 1, {"landed": False, "reason": f"merge of {integration} failed; merge it by hand"}
+    else:
+        candidate, problem = _verified_candidate(root, state, config, base_tip, message)
+        if candidate is None:
+            return 1, {"landed": False, "reason": problem}
+        if not git_ok(root, "merge", "--ff-only", candidate):
+            return 1, {"landed": False, "reason": f"{state['base_branch']} moved again during verification; land again"}
     state["landed_commit"] = git(root, "rev-parse", "HEAD")
     save_state(root, state)
+    log(root, "landed", run=run_id(state), commit=state["landed_commit"])
     return 0, {"landed": True, "commit": state["landed_commit"], "epics": [e["id"] for e in merged]}
+
+
+def _verified_candidate(
+    root: Path, state: dict[str, Any], config: dict[str, Any], base_tip: str, message: str
+) -> tuple[str | None, str]:
+    """Merge integration into the moved base in a scratch worktree and run every check there."""
+    scratch = Path(state["worktree_root"]) / "_land"
+    if scratch.exists():
+        git(root, "worktree", "remove", "--force", str(scratch), check=False)
+        shutil.rmtree(scratch, ignore_errors=True)
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    git(root, "worktree", "add", "-q", "--detach", str(scratch), base_tip)
+    try:
+        if not git_ok(scratch, *identity_args(scratch), "merge", "--no-ff", "-m", message, state["integration_branch"]):
+            return None, (f"{state['base_branch']} moved since the run started and merging "
+                          f"{state['integration_branch']} into it conflicts; merge it by hand")
+        _initialise_worktree(root, scratch, config, "land")
+        failing = [f"{r['name']}: {r['summary']}" for r in checks_only(scratch, config, None) if not r["passed"]]
+        if failing:
+            return None, (f"{state['base_branch']} moved since the run started and the combined tree fails the "
+                          "gate checks: " + "; ".join(failing))
+        return git(scratch, "rev-parse", "HEAD"), ""
+    finally:
+        git(root, "worktree", "remove", "--force", str(scratch), check=False)
+
+
+ARCHIVED = ("state.json", "epics.json", "epics.md", "program.md", "dag.md", "report.md", "approvals.json",
+            "log.jsonl", "run-config.json")
+
+
+def new_run(root: Path) -> tuple[int, dict[str, Any]]:
+    """Archive a finished run so the next one is planned from scratch (fresh epics and handbook).
+
+    The decision log stays: product decisions outlive a run.
+    """
+    state_dir = ensure_state_dir(root)
+    state = read_json_lenient(state_dir / "state.json")
+    if not isinstance(state, dict):
+        return 1, {"ok": False, "error": "no run to archive"}
+    if drive_owner(root) is not None:
+        return 1, {"ok": False, "error": "a drive is running"}
+    stage = run_status(root)["stage"]
+    if stage not in ("landed", "land-rejected", "plan-rejected", "finished-nothing-merged", "awaiting-plan-approval"):
+        return 1, {"ok": False, "error": f"the current run is not finished (stage: {stage}); "
+                   "finish, land or reject it first"}
+    target = state_dir / "runs" / run_id(state)
+    target.mkdir(parents=True, exist_ok=True)
+    moved = []
+    for name in ARCHIVED:
+        source = state_dir / name
+        if source.exists():
+            os.replace(source, target / name)
+            moved.append(name)
+    stop_file(root).unlink(missing_ok=True)
+    return 0, {"ok": True, "archived": str(target.relative_to(root)), "files": moved}
 
 
 def reset_epic(root: Path, config: dict[str, Any], epic_id: str) -> tuple[int, dict[str, Any]]:

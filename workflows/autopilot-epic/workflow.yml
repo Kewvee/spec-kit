@@ -158,6 +158,8 @@ steps:
           - id: converge
             command: speckit.converge
             integration: "{{ inputs.integration }}"
+            input:
+              args: "TEAM CONTEXT: you are a developer on a team, working unattended. Before comparing the code with the feature artifacts, read .specify/autopilot/context/epic-context.md, program.md and decisions.md: the program's architecture, conventions, contracts between epics and every team decision are part of the intent too. Do not append tasks that contradict them or that belong to another epic's files. Nobody reads chat."
 
           - id: consult
             type: shell

@@ -31,7 +31,7 @@ AP = python3 .specify/extensions/autopilot/scripts/python/autopilot.py
    | **Ambiguous spec** | clarification markers in `spec.md`; the reviewer and implementer disagree on intent | Ask the user the open question. Edit `spec.md` in the epic's worktree to record the answer |
    | **Environment or gate config** | the same check fails identically every iteration with an environment error (missing tool, dependency not installed, wrong command) | Fix `gate.checks` or `run.setup` in `.specify/extensions/autopilot/autopilot-config.yml`, or install the missing tool, with the user's approval |
    | **Implementation stuck** | the same test or review finding repeats; the cap was reached | With the user's approval, make the minimal fix in the epic's worktree yourself, or add a precise task to `tasks.md` in a new phase so the next pipe iteration does it |
-   | **Merge conflict** | reason mentions a conflict with the integration branch | In the epic's worktree, rebase onto `autopilot/integration`, resolve the conflict with the user, and commit. The scheduler verifies again on merge |
+   | **Merge conflict** | reason mentions a conflict with the integration branch | In the epic's worktree, rebase onto the run's integration branch (`integration_branch` in `.specify/autopilot/state.json`), resolve the conflict with the user, and commit. The scheduler verifies again on merge |
    | **Plan problem** | the epic is too big to converge, or depends on work no epic does | Say so. Re-planning means a new run, so offer to land what merged first |
    | **Infrastructure** | agent CLI crashed, timed out, or a permissions prompt blocked it | Report it. Often it can just be reset |
 

@@ -66,6 +66,14 @@ steps:
     options: [approve, reject]
     on_reject: abort
 
+  # The gate's approval is the product owner's written verdict: record it, so
+  # drive (which refuses an unapproved plan) can start.
+  - id: approve-plan
+    type: shell
+    strict: true
+    output_format: json
+    run: "python3 .specify/extensions/autopilot/scripts/python/autopilot.py approve plan --via workflow-gate --no-act"
+
   # Event-driven DAG scheduler: worktree per epic, parallel pipes up to
   # run.max_parallel, merge one epic at a time with re-verification, caps on
   # iterations, wall time and agent calls. Re-running the workflow (or
@@ -93,8 +101,9 @@ steps:
     options: [approve, reject]
     on_reject: abort
 
+  # Records the approval and lands (land refuses without a recorded approval).
   - id: land
     type: shell
     strict: true
     output_format: json
-    run: "python3 .specify/extensions/autopilot/scripts/python/autopilot.py land"
+    run: "python3 .specify/extensions/autopilot/scripts/python/autopilot.py approve land --via workflow-gate"

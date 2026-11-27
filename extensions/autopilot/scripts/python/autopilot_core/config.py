@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 CONFIG_RELATIVE = Path(".specify") / "extensions" / "autopilot" / "autopilot-config.yml"
+LOCAL_RELATIVE = CONFIG_RELATIVE.parent / "local-config.yml"
+ENV_PREFIX = "SPECKIT_AUTOPILOT_"
+# The epic workflow's build loop has a literal ceiling (do-while max_iterations).
+WORKFLOW_ITERATION_CEILING = 25
 
 DEFAULTS: dict[str, Any] = {
     "gate": {
@@ -55,8 +60,10 @@ DEFAULTS: dict[str, Any] = {
         "timeout_minutes": 480,
         "max_agent_calls": 200,
         "base_branch": "",
-        "integration_branch": "autopilot/integration",
-        "branch_prefix": "autopilot/",
+        # ``{run}`` is replaced by the run ID, so every planned run gets fresh
+        # branches and worktrees and never reuses an earlier run's work.
+        "integration_branch": "autopilot/{run}/integration",
+        "branch_prefix": "autopilot/{run}/",
         "worktree_root": "",
         "specify_command": "specify",
         # Shell command run once in every new worktree (install dependencies).
@@ -97,19 +104,93 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 
 
 def load_config(project_root: Path, path: Path | None = None) -> dict[str, Any]:
-    """Return DEFAULTS merged with the project's config file (if present)."""
+    """The effective configuration.
+
+    Precedence, lowest first (the extension configuration contract):
+    built-in defaults, ``autopilot-config.yml``, ``local-config.yml``, then
+    ``SPECKIT_AUTOPILOT_<SECTION>_<KEY>`` environment variables. A pipe launched
+    by the scheduler instead reads the run's snapshot named by
+    ``AUTOPILOT_CONFIG``, so it always uses the conductor's current settings.
+    """
+    snapshot = os.environ.get("AUTOPILOT_CONFIG", "").strip()
+    if path is None and snapshot:
+        snapshot_path = Path(snapshot)
+        try:
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"run config snapshot {snapshot_path} is unreadable: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ConfigError(f"{snapshot_path}: top level must be a mapping")
+        config = _deep_merge(DEFAULTS, data)
+        _validate(config, snapshot_path)
+        return config
     config_path = path or (project_root / CONFIG_RELATIVE)
-    if not config_path.is_file():
-        return copy.deepcopy(DEFAULTS)
-    text = config_path.read_text(encoding="utf-8")
-    data = parse_yaml(text)
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        raise ConfigError(f"{config_path}: top level must be a mapping")
-    config = _deep_merge(DEFAULTS, data)
+    config = copy.deepcopy(DEFAULTS)
+    layers = [config_path] if path is not None else [config_path, project_root / LOCAL_RELATIVE]
+    for layer in layers:
+        if not layer.is_file():
+            continue
+        data = parse_yaml(layer.read_text(encoding="utf-8"))
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ConfigError(f"{layer}: top level must be a mapping")
+        config = _deep_merge(config, data)
+    if path is None:
+        config = _deep_merge(config, env_overrides(os.environ))
     _validate(config, config_path)
     return config
+
+
+def _leaf_paths(tree: dict[str, Any], prefix: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    paths: list[tuple[str, ...]] = []
+    for key, value in tree.items():
+        if isinstance(value, dict):
+            paths += _leaf_paths(value, prefix + (key,))
+        else:
+            paths.append(prefix + (key,))
+    return paths
+
+
+def _env_value(raw: str) -> Any:
+    text = raw.strip()
+    if text[:1] in "[{":
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return raw
+    if re.fullmatch(r"-?\d+", text):
+        return int(text)
+    if text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    return raw
+
+
+def env_overrides(environ: Any) -> dict[str, Any]:
+    """``SPECKIT_AUTOPILOT_PIPE_MAX_ITERATIONS=8`` -> ``{"pipe": {"max_iterations": 8}}``.
+
+    Names are matched against the known keys, so keys that contain underscores
+    work. Lists and check entries take JSON (``'["tests/**"]'``).
+    """
+    overrides: dict[str, Any] = {}
+    for leaf in _leaf_paths(DEFAULTS):
+        name = ENV_PREFIX + "_".join(part.upper() for part in leaf)
+        if name not in environ:
+            continue
+        current = overrides
+        for part in leaf[:-1]:
+            current = current.setdefault(part, {})
+        current[leaf[-1]] = _env_value(environ[name])
+    return overrides
+
+
+def write_snapshot(config: dict[str, Any], path: Path) -> Path:
+    """Freeze the effective config for pipes (see ``AUTOPILOT_CONFIG``)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def _validate(config: dict[str, Any], path: Path) -> None:
@@ -135,8 +216,33 @@ def _validate(config: dict[str, Any], path: Path) -> None:
         value = config[section][key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ConfigError(f"{path}: {section}.{key} must be a positive integer")
-    if not isinstance(config["run"]["sync_paths"], list):
-        raise ConfigError(f"{path}: run.sync_paths must be a list")
+    if config["pipe"]["max_iterations"] > WORKFLOW_ITERATION_CEILING:
+        raise ConfigError(
+            f"{path}: pipe.max_iterations must be at most {WORKFLOW_ITERATION_CEILING} "
+            "(the autopilot-epic workflow's loop ceiling)"
+        )
+    for key in ("require_tasks_complete", "require_review"):
+        if not isinstance(config["gate"][key], bool):
+            raise ConfigError(f"{path}: gate.{key} must be true or false")
+    acceptance = config["gate"]["acceptance"]
+    if not isinstance(acceptance, dict):
+        raise ConfigError(f"{path}: gate.acceptance must be a mapping")
+    if not isinstance(acceptance.get("required"), bool):
+        raise ConfigError(f"{path}: gate.acceptance.required must be true or false")
+    globs = acceptance.get("test_globs")
+    if not isinstance(globs, list) or not globs or not all(isinstance(g, str) and g.strip() for g in globs):
+        raise ConfigError(f"{path}: gate.acceptance.test_globs must be a non-empty list of non-empty strings")
+    if not isinstance(acceptance.get("scenario_command", ""), str):
+        raise ConfigError(f"{path}: gate.acceptance.scenario_command must be a string")
+    for key in ("base_branch", "integration_branch", "branch_prefix", "worktree_root", "specify_command",
+                "setup", "integration", "reviewer_model", "lead_model"):
+        if not isinstance(config["run"][key], str):
+            raise ConfigError(f"{path}: run.{key} must be a string")
+    if not config["run"]["specify_command"].strip():
+        raise ConfigError(f"{path}: run.specify_command must not be empty")
+    sync = config["run"]["sync_paths"]
+    if not isinstance(sync, list) or not all(isinstance(p, str) and p.strip() for p in sync):
+        raise ConfigError(f"{path}: run.sync_paths must be a list of non-empty strings")
 
 
 def configured_checks(config: dict[str, Any]) -> list[dict[str, str]]:

@@ -6,11 +6,15 @@ Usage (from the project root, or an epic worktree for the pipe commands):
   Conductor (main checkout)
     autopilot.py preflight [--requirements DIR] [--baseline]
     autopilot.py plan-check [--reset]
-    autopilot.py drive [--integration KEY] [--detach]
+    autopilot.py approve plan|land [--reject] [--note TEXT] [--run RUN_ID] [--no-act]
+                                 the product owner's verdict; approving the plan
+                                 starts a detached drive, approving land lands
+    autopilot.py drive [--integration KEY] [--detach]   (needs an approved plan)
     autopilot.py status          stage, live drive, epic table, recent events
     autopilot.py stop | unstop   ask the drive to start no new pipes / undo
     autopilot.py report
-    autopilot.py land
+    autopilot.py land            (needs an approved final merge)
+    autopilot.py new-run         archive a finished run before planning the next
     autopilot.py reset EPIC_ID
     autopilot.py answer QUESTION_ID --text "..."   the product owner answers
 
@@ -38,6 +42,9 @@ import os
 import sys
 from pathlib import Path
 
+# Running from an epic worktree must not leave __pycache__ files next to the
+# copied extension (they would look like new work to the gate).
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from autopilot_core import driver, gate, team  # noqa: E402
@@ -62,8 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
     drv = sub.add_parser("drive")
     drv.add_argument("--integration", default=os.environ.get("AUTOPILOT_INTEGRATION", ""))
     drv.add_argument("--detach", action="store_true", help="start in the background and return immediately")
-    for name in ("status", "report", "land", "stop", "unstop", "check-spec", "gate", "decide", "pipe-result", "checks"):
+    for name in ("status", "report", "land", "new-run", "stop", "unstop", "check-spec", "gate", "decide",
+                 "pipe-result", "checks"):
         sub.add_parser(name)
+    appr = sub.add_parser("approve", help="record the product owner's verdict on a gate")
+    appr.add_argument("gate", choices=["plan", "land"])
+    appr.add_argument("--reject", action="store_true")
+    appr.add_argument("--note", default="")
+    appr.add_argument("--run", default="", help="the run ID being approved (must be the current run)")
+    appr.add_argument("--via", default="agent chat")
+    appr.add_argument("--no-act", action="store_true", help="only record: do not start the drive / land")
     reset = sub.add_parser("reset")
     reset.add_argument("epic_id")
     for name in ("consult", "record"):
@@ -97,14 +112,20 @@ def main(argv: list[str] | None = None) -> int:
             return _emit(*driver.drive(root, config, integration=args.integration))
         if args.command == "status":
             return _emit(0, driver.run_status(root))
-        if args.command in ("stop", "unstop"):
+        if args.command == "stop":
             path = driver.stop_file(root)
             path.parent.mkdir(parents=True, exist_ok=True)
-            if args.command == "stop":
-                path.write_text("stop requested\n", encoding="utf-8")
-            else:
-                path.unlink(missing_ok=True)
-            return _emit(0, {"stop_requested": path.exists()})
+            path.write_text("stop requested\n", encoding="utf-8")
+            return _emit(0, {"stop_requested": True})
+        if args.command == "unstop":
+            return _emit(0, driver.unstop(root))
+        if args.command == "approve":
+            return _emit(*driver.approve(
+                root, config, args.gate, accept=not args.reject, via=args.via, note=args.note,
+                expected_run=args.run, cli=Path(__file__).resolve(), act=not args.no_act,
+            ))
+        if args.command == "new-run":
+            return _emit(*driver.new_run(root))
         if args.command == "report":
             return _emit(*driver.report(root, config))
         if args.command == "land":

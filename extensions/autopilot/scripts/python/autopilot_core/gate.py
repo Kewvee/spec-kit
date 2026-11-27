@@ -32,6 +32,7 @@ from typing import Any
 
 from . import spec as spec_mod
 from .config import configured_checks
+from .questions import open_blocking, questions_dir
 from .util import (
     ensure_state_dir,
     exclude_pathspecs,
@@ -51,6 +52,12 @@ LOOP_END = TERMINAL | PAUSED
 BLOCKING_SEVERITIES = {"blocker", "major"}
 VALID_SEVERITIES = {"blocker", "major", "minor", "nit"}
 DETAIL_LIMIT = 6000
+QUESTIONS_CHECK = "open-questions"
+NO_CHECKS = (
+    "no gate checks configured (gate.checks in .specify/extensions/autopilot/autopilot-config.yml has no "
+    "command): without tests and lint the gate proves nothing, so the pipe cannot pass. Run "
+    "/speckit.autopilot.setup or fill gate.checks, then reset the epic."
+)
 MAX_SCAN_BYTES = 2_000_000
 
 
@@ -135,22 +142,37 @@ def check_spec(project_root: Path, config: dict[str, Any]) -> tuple[int, dict[st
     markers = spec_mod.clarification_markers(text)
 
     state = ensure_pipe(project_root, config, feature_dir)
+    if state["status"] in LOOP_END:
+        # Paused for the product owner, or already failed/escalated by a consult:
+        # stop here and keep the original reason.
+        return 1, {"ok": False, "feature_dir": state["feature_dir"], "status": state["status"],
+                   "problems": [state["reason"]]}
     state["scenarios"] = [s.tag for s in scenarios]
-    if state["status"] in PAUSED:
-        # A spec question went to the product owner; consult already said so.
-        return 1, {"ok": False, "feature_dir": state["feature_dir"], "problems": [state["reason"]]}
 
     problems = []
+    if not configured_checks(config):
+        problems.append(NO_CHECKS)
     if markers:
         problems.append(
             f"spec.md still has {markers} [NEEDS CLARIFICATION] marker(s); an unattended run "
             "cannot answer them. Resolve them (or run /speckit.clarify) and re-run the pipe."
         )
-    if not scenarios and config["gate"]["acceptance"]["required"]:
-        problems.append(
-            "spec.md has no numbered acceptance scenarios under '**Acceptance Scenarios**:' "
-            "in any '### User Story N' section, so the gate has nothing to verify."
-        )
+    if config["gate"]["acceptance"]["required"]:
+        if not scenarios:
+            problems.append(
+                "spec.md has no numbered acceptance scenarios under '**Acceptance Scenarios**:' "
+                "in any '### User Story N' section, so the gate has nothing to verify."
+            )
+        else:
+            covered = {s.story for s in scenarios}
+            bare = [n for n in spec_mod.user_stories(text) if n not in covered]
+            if bare:
+                problems.append(
+                    "user stor" + ("y " if len(bare) == 1 else "ies ") + ", ".join(str(n) for n in bare)
+                    + " in spec.md ha" + ("s" if len(bare) == 1 else "ve")
+                    + " no numbered acceptance scenarios; every story needs at least one, "
+                    "or the gate cannot require its tests."
+                )
     if problems:
         _finish(state, "escalated", " ".join(problems))
         save_pipe(project_root, feature_dir, state)
@@ -248,6 +270,15 @@ def check_acceptance(project_root: Path, config: dict[str, Any], feature_dir: Pa
 
 def run_checks(project_root: Path, config: dict[str, Any], feature_dir: Path) -> list[CheckResult]:
     results: list[CheckResult] = []
+    waiting = open_blocking(questions_dir(project_root, feature_dir))
+    results.append(
+        CheckResult(
+            QUESTIONS_CHECK,
+            not waiting,
+            f"{len(waiting)} blocking question(s) without an answer",
+            "\n".join(f"- {q['id']}: {q['question']}" for q in waiting[:10]),
+        )
+    )
     spec_path = feature_dir / "spec.md"
     tasks_path = feature_dir / "tasks.md"
     spec_text = spec_path.read_text(encoding="utf-8") if spec_path.is_file() else ""
@@ -363,6 +394,11 @@ def run_gate(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     if state["status"] in LOOP_END:
         return {"finished": True, "checks_passed": False, "status": state["status"], "reason": state["reason"]}
 
+    if not configured_checks(config):
+        _finish(state, "escalated", NO_CHECKS)
+        save_pipe(project_root, feature_dir, state)
+        return {"finished": True, "checks_passed": False, "status": state["status"], "reason": state["reason"]}
+
     state["iteration"] += 1
     iteration = state["iteration"]
     checks = run_checks(project_root, config, feature_dir)
@@ -403,8 +439,11 @@ def run_gate(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
             output["finished"] = True
     else:
         failed = [c for c in checks if not c.passed]
-        entry["fingerprint"] = fingerprint([(c.name, c.summary + "\n" + c.detail) for c in failed])
-        if _is_stuck(state["history"], "fingerprint", entry["fingerprint"], config["pipe"]["stuck_after"], consecutive=True):
+        # An unanswered question repeats while the lead retries; it is not a stuck loop.
+        real = [c for c in failed if c.name != QUESTIONS_CHECK]
+        entry["fingerprint"] = fingerprint([(c.name, c.summary + "\n" + c.detail) for c in real])
+        if real and _is_stuck(state["history"], "fingerprint", entry["fingerprint"], config["pipe"]["stuck_after"],
+                              consecutive=True):
             _finish(state, "escalated", f"identical gate failure {config['pipe']['stuck_after']} iterations in a row: "
                     + ", ".join(c.name for c in failed))
             output["finished"] = True
@@ -506,6 +545,12 @@ def pipe_result(project_root: Path) -> tuple[int, dict[str, Any]]:
     state = load_pipe(project_root, feature_dir)
     if state is None:
         return 1, {"status": "missing", "reason": "no pipe state"}
+    history = state.get("history") or []
+    if state["status"] == "running" and history and history[-1].get("reopened"):
+        # Reopened after the product owner answered (standalone pipe): a resumed old
+        # run lands here; the work continues in a new run, so do not fail the pipe.
+        return 1, {"status": "running", "reason": "reopened after the product owner's answers; start a new "
+                   "autopilot-epic run (phase from the existing artifacts) instead of resuming this one"}
     if state["status"] not in LOOP_END:
         _finish(state, "failed", "loop ended without a gate decision (loop ceiling reached)")
         save_pipe(project_root, feature_dir, state)

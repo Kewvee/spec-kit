@@ -15,7 +15,7 @@ requirements (docs/requirements)
  ┌────┼────┐
  PIPE PIPE PIPE   specify → plan → tasks → ⟲ implement → converge → GATE → review ⟲
  └────┼────┘      exits only when the gate and an independent reviewer pass
-  MERGE       one epic at a time into autopilot/integration, re-verified after each merge
+  MERGE       one epic at a time into the run's integration branch, re-verified after each merge
       │
   ◆ human gate: approve the final merge (report.md) → land into the base branch
 ```
@@ -45,7 +45,7 @@ These come from the autopilot's design and decide most of its behavior:
 
 - `program.md`, the **team handbook** the lead writes at planning time: product, architecture, conventions, the shared contracts between epics, glossary, ground rules. You review it at gate 1.
 - `epic-context.md`, an **onboarding brief** the scheduler generates in code at every launch: the epic itself, what its dependencies already built (and what they `provide`), which teammates are working in parallel and on which files, which epics wait on this one and what they need, the files this epic owns, and how to ask the lead.
-- `decisions.md`, the team's **decision log**: every answer given so far, binding on all epics.
+- `decisions.md`, the team's **decision log**: every answer given so far that binds this epic (program-wide answers, plus answers scoped to this epic).
 
 **Asking before guessing.** Small choices a developer decides and records as assumptions. When a wrong guess would be costly (a contract another epic uses, the data model, public behavior, security, requirements that seem to conflict) it writes a question file and carries on with other work. An unresolved `[NEEDS CLARIFICATION]` marker in a spec becomes a question too.
 
@@ -53,7 +53,7 @@ After specify, after design, and in every build iteration, a `consult → lead �
 
 1. `consult` (code) files new questions and answers repeats straight from the decision log.
 2. The **team lead** agent answers from the handbook, requirements, constitution and earlier decisions, or marks the question `needs_human` when it is a product decision (scope, conflicting requirements, security or legal, cost). It is read-only, enforced by the same tree fingerprint as the reviewer.
-3. `record` (code) publishes each answer to the program-wide decision log and hands it back: as an edit replacing the spec marker, or as a `Team Decisions` task for the next `implement`.
+3. `record` (code) publishes each answer to the decision log and hands it back: as an edit replacing the spec marker (every occurrence), or as a `Team Decisions` task for the next `implement`. Answers the lead marks `applies_to: epic` bind only that epic. When two developers asked the same question in parallel, the first answer published wins and the other developer gets that decision instead of a contradicting one. The next step already sees the new decisions.
 
 A question for you pauses **only that developer** (`awaiting-human`). Its slot frees and the rest of the team keeps working. `/speckit.autopilot.run` presents the question with options and the lead's recommendation; your answer becomes a decision, and the drive resumes that epic where it left off. Caps: `pipe.max_questions` per epic (more means the epic is under-specified and is escalated), and a question the lead fails to answer twice goes to you.
 
@@ -127,10 +127,10 @@ run:
 
 1. **Preflight.** It checks git, a clean tree, the configured gate (running it on `HEAD`), `specify` on PATH and the installed workflow. It fixes what it can with your permission: running setup, committing your requirements, installing the workflow.
 2. **Plan.** The chat agent is the conductor. It plans the epics itself (`/speckit.autopilot.epics`) and validates them into `.specify/autopilot/dag.md`.
-3. **Gate 1.** It shows the epic table, dependencies (including any the scheduler added), requirement coverage, assumptions and the worst-case agent-call cost. You approve, ask for changes (it edits and re-validates), or cancel. Only your explicit approval in the conversation counts.
-4. **Drive.** It starts the scheduler detached from the chat (`drive --detach`), so the run survives the session. One drive per checkout, guarded by a lock. If the agent can wait it reports changes as they happen; otherwise run `/speckit.autopilot.status` whenever you like.
+3. **Gate 1.** It shows the epic table, dependencies (including any the scheduler added), requirement coverage, assumptions and the worst-case agent-call cost. You approve, ask for changes (it edits and re-validates), or cancel. Only your explicit approval in the conversation counts. It is recorded (`approve plan`, in `.specify/autopilot/approvals.json` with the run ID); `drive` refuses to start without it, and a rejected plan stays rejected until a new plan is checked.
+4. **Drive.** Recording the approval starts the scheduler detached from the chat, so the run survives the session. One drive per checkout, guarded by an operating-system lock that a crashed drive cannot leave behind. If the agent can wait it reports changes as they happen; otherwise run `/speckit.autopilot.status` whenever you like.
 5. **Gate 2.** When the drive finishes it writes `.specify/autopilot/report.md` and shows it with the integration branch's log and diffstat, plus any epic that needs you (offering `/speckit.autopilot.recover`). You approve the merge or hold.
-6. **Land.** It merges `autopilot/integration` into your base branch with a merge commit, then offers to clean up epic branches and worktrees.
+6. **Land.** Your approval is recorded (`approve land`), then the run's integration branch is merged into your base branch with a merge commit. If the base branch moved during the run, the combination is first merged and verified with every gate check in a scratch worktree, and the base branch only fast-forwards to that verified commit. It then offers to clean up epic branches and worktrees.
 
 To halt new work: `/speckit.autopilot.run stop` (running pipes finish). To check in: `/speckit.autopilot.status`.
 
@@ -144,7 +144,7 @@ specify workflow resume <run_id> --input autopilot_review_epics_verdict=approve
 specify workflow resume <run_id> --input autopilot_review_land_verdict=approve
 ```
 
-Its steps are the engine calls the chat commands make: `preflight --baseline`, the `speckit.autopilot.epics` command, `plan-check`, gate, `drive`, `report`, gate, `land`.
+Its steps are the engine calls the chat commands make: `preflight --baseline`, the `speckit.autopilot.epics` command, `plan-check`, gate, `approve plan` (records the gate's verdict), `drive`, `report`, gate, `approve land` (records it and lands). Rejecting either gate aborts the workflow, and nothing after it runs.
 
 ## The epic plan
 
@@ -168,7 +168,7 @@ Every agent step first reads the team context (handbook, brief, decisions).
 | --- | --- | --- |
 | `specify` | agent | Writes `spec.md` from the brief, fitting the handbook; leaves a `[NEEDS CLARIFICATION]` marker only for a costly question |
 | `consult → lead → record` | code, agent, code | Spec questions answered by the team lead and written into the spec (or sent to you) |
-| `check-spec` | code | Stops the pipe on a spec still waiting for you, or without acceptance scenarios; derives scenario IDs |
+| `check-spec` | code | Stops the pipe on a spec still waiting for you, a user story without acceptance scenarios, or a project with no gate checks configured; derives scenario IDs |
 | `plan`, `tasks` | agent | Plan within the handbook's architecture and contracts; tasks are told the scenario IDs and that tests are required |
 | `consult → lead → record` | code, agent, code | Design questions answered before any code is written |
 | `implement` | agent | Completes every open task, including converge, team-decision and remediation tasks; asks instead of guessing |
@@ -186,6 +186,7 @@ All must pass for the pipe to reach review:
 | Check | Passes when |
 | --- | --- |
 | `spec-clarity` | `spec.md` has no `[NEEDS CLARIFICATION` marker |
+| `open-questions` | no blocking question to the lead is still unanswered |
 | `tasks-complete` | `tasks.md` has no unchecked task, so the last converge pass appended nothing |
 | each `gate.checks` entry | the command exits 0 |
 | `acceptance-coverage` | every acceptance scenario ID appears in a test file (and `scenario_command`, when set, passes per scenario) |
@@ -208,7 +209,7 @@ When the checks pass, the gate stages the epic's work, writes its full diff agai
 
 - `blocker` or `major` findings fail the iteration **whatever verdict the reviewer declared**, and become remediation tasks.
 - A missing, malformed or invalid review never passes.
-- If the working tree changed during the review, the epic is escalated: a reviewer must not edit code.
+- If the working tree or the commit changed during the review, the epic is escalated: a reviewer must not edit or commit code. Workflow checkpoints and autopilot state are ignored by this check.
 
 Use `run.reviewer_model` (or the workflow's `reviewer_model` input) to review with a different model from the implementer.
 
@@ -219,14 +220,15 @@ Use `run.reviewer_model` (or the workflow's `reviewer_model` input) to review wi
 | `passed` | gate checks and review passed |
 | `failed` | `pipe.max_iterations` reached, or the pipe timed out |
 | `awaiting-human` | a question only you can answer; resumes by itself once you answer |
-| `escalated` | the same gate failure (normalized) `stuck_after` times in a row, the same blocking review findings repeated, too many questions, a reviewer or lead that edited files, a merge conflict, or checks failing after merge |
+| `escalated` | the same gate failure (normalized) `stuck_after` times in a row, the same blocking review findings repeated, too many questions, an unreadable question file, no gate checks configured, a reviewer or lead that edited files, a merge conflict, or checks failing after merge |
 
 ## Scheduling and merging
 
 `drive` is event-driven, not wave-based: a pipe starts as soon as its dependencies are **merged** and a slot is free, so a slow epic only delays its own dependents.
 
-- Each epic gets branch `autopilot/NNN-slug` and a worktree under `<repo-parent>/<repo>.worktrees/autopilot/`, branched from the integration branch's current head. Untracked Spec Kit and agent files (`run.sync_paths`) are copied in; `run.setup` runs once.
-- When a pipe passes, its work is committed (commit hooks run; autopilot state, synced files and workflow run state are never committed) and merged into `autopilot/integration` with `--no-ff`, **one at a time**.
+- Every planned run has an ID (for example `r1127-4f2a`). Each epic gets branch `autopilot/<run-id>/NNN-slug` and a worktree under `<repo-parent>/<repo>.worktrees/autopilot/<run-id>/`, branched from the run's integration branch (`autopilot/<run-id>/integration`). A re-plan therefore never reuses an earlier run's branches, worktrees or pipe state. Untracked Spec Kit and agent files (`run.sync_paths`) are copied in; `run.setup` runs until it succeeds once.
+- Pipes always read the conductor's current configuration (a snapshot written at each launch), and run with the epic's worktree as the Spec Kit project, whatever the caller's environment says.
+- When a pipe passes, its work is committed (commit hooks run) and merged into the integration branch with `--no-ff`, **one at a time**. Autopilot state, workflow checkpoints, `.specify/feature.json`, new files under `.specify/` and exactly the files the scheduler copied in are never committed, even if an agent staged them. Other new files, such as a new skill under `.github/skills/`, are committed and reviewed. A branch that commits runtime files anyway is not merged.
 - On a merge conflict the epic branch is rebased onto the integration branch, re-verified, and merged again; if the rebase conflicts the epic is escalated. Nothing is force-resolved.
 - After every merge the gate checks run again on the integration branch. If they fail, the merge is reverted and the epic is escalated.
 - Epics depending on an epic that did not merge become `blocked`.
@@ -238,14 +240,16 @@ Use `run.reviewer_model` (or the workflow's `reviewer_model` input) to review wi
 | --- | --- | --- |
 | Iterations per epic | `pipe.max_iterations` | Pipe fails when reached |
 | Repeated identical failure | `pipe.stuck_after` | Pipe escalates |
-| Wall time per epic | `pipe.timeout_minutes` | Pipe process is killed and the epic fails |
+| Wall time per epic | `pipe.timeout_minutes` | The pipe's whole process tree (agent CLIs, checks) is killed and the epic fails |
 | Wall time per run | `run.timeout_minutes` | No new pipe starts; running pipes finish |
-| Cost ceiling | `run.max_agent_calls` | A pipe reserves its worst case (`5 + 4 × max_iterations` agent calls, including the lead's consults) before starting; no pipe starts that would exceed the budget |
+| Cost ceiling | `run.max_agent_calls` | A pipe reserves its worst case (`5 + 4 × max_iterations` agent calls, including the lead's consults) before starting. A pipe that would not fit waits while others run (they may use less than they reserved); the run halts only when nothing running can free budget. Every attempt is charged, including crashed ones |
 | Parallelism | `run.max_parallel` | Concurrent pipes |
 | Infrastructure retries | `pipe.max_attempts` | Re-launch after an agent CLI crash (not after a gate failure) |
 | Emergency stop | `/speckit.autopilot.run stop` | No new pipe starts; running pipes finish |
 
 The agent-call budget is a proxy for cost: integration CLIs do not report spend uniformly. Set it from the price of a typical agent call on your integration.
+
+Configuration is layered like every extension's: `autopilot-config.yml`, then `local-config.yml` beside it (machine-specific, not committed), then `SPECKIT_AUTOPILOT_<SECTION>_<KEY>` environment variables (`SPECKIT_AUTOPILOT_RUN_MAX_PARALLEL=3`; lists as JSON). `pipe.max_iterations` is capped at 25, the workflow's loop ceiling.
 
 ## State and recovery
 
@@ -256,11 +260,14 @@ The agent-call budget is a proxy for cost: integration CLIs do not report spend 
 | `.specify/autopilot/state.json` | Scheduler state (owned by plain code) |
 | `.specify/autopilot/log.jsonl`, `logs/` | Events and each pipe's CLI output |
 | `.specify/autopilot/report.md` | Run report shown at the final gate |
+| `.specify/autopilot/approvals.json` | The product owner's verdicts on both gates for the current run |
+| `.specify/autopilot/runs/<run-id>/` | Earlier runs, archived by `new-run` |
 | `<worktree>/.specify/autopilot/pipes/<feature>/` | `pipe.json`, `gate-N.md`, `review-N.diff`, `review-N.json` |
 
-- **Interrupted run** (machine slept, terminal closed): `/speckit.autopilot.run` sees the `interrupted` stage and resumes. Running pipes resume their workflow run; finished pipes are not repeated.
+- **Interrupted run** (machine slept, terminal closed): `/speckit.autopilot.run` sees the `interrupted` stage and resumes. A pipe process left over from the dead drive is stopped first. A pipe whose workflow run paused or failed is resumed; one whose run was cut off mid-step starts a new run at its first missing artifact, keeping the work on disk. Finished pipes are not repeated.
+- **Standalone pipe answered by you**: answering a question of an `autopilot-epic` run started by hand reopens that pipe and tells you the command to continue it (a new run at the right phase).
 - **Escalated or failed epic**: `/speckit.autopilot.recover <EPIC>` diagnoses the cause from the gate reports, reviews and logs. It agrees a fix with you (answer a spec question, fix the gate config, a targeted code fix, or resolve a merge conflict) and applies it in the epic's worktree. Then it resets the epic and the epics it blocked, which grants a fresh iteration allowance and restarts the pipe at its build loop without re-running `specify` over the spec, and resumes the drive.
-- **Start over**: after a landed run, `/speckit.autopilot.run` asks before discarding the scheduler state for a new run. Branches and worktrees are left in place until you agree to remove them.
+- **Start over**: after a landed (or rejected) run, `/speckit.autopilot.run` asks, then archives it (`new-run`) and plans the next run from fresh epics and a fresh handbook. Team decisions carry over. Branches and worktrees are left in place until you agree to remove them.
 
 ## Limitations
 

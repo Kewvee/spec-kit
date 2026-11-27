@@ -1,5 +1,8 @@
 # Spec Kit autopilot configuration
 # Installed at .specify/extensions/autopilot/autopilot-config.yml.
+# Machine-specific overrides go in local-config.yml next to it (same keys), and
+# SPECKIT_AUTOPILOT_<SECTION>_<KEY> environment variables override both, e.g.
+# SPECKIT_AUTOPILOT_RUN_MAX_PARALLEL=3 or SPECKIT_AUTOPILOT_GATE_ACCEPTANCE_TEST_GLOBS='["tests/**"]'.
 # Run /speckit.autopilot.setup to fill gate.checks from AGENTS.md and prove the
 # gate is green before the first unattended run.
 
@@ -29,7 +32,8 @@ gate:
     scenario_command: ""
 
 pipe:
-  # Hard cap on implement -> converge -> gate -> review iterations per epic.
+  # Hard cap on implement -> converge -> gate -> review iterations per epic
+  # (at most 25, the workflow's loop ceiling).
   max_iterations: 5
   # Escalate to a human when the same failure repeats this many times in a row.
   stuck_after: 2
@@ -51,8 +55,10 @@ run:
   max_agent_calls: 200
   # Empty: the branch checked out when the plan is checked.
   base_branch: ""
-  integration_branch: "autopilot/integration"
-  branch_prefix: "autopilot/"
+  # {run} is replaced by the run ID: every planned run gets fresh branches and
+  # worktrees, so a re-plan never reuses an earlier run's work.
+  integration_branch: "autopilot/{run}/integration"
+  branch_prefix: "autopilot/{run}/"
   # Empty: <repo-parent>/<repo-name>.worktrees/autopilot
   worktree_root: ""
   specify_command: "specify"
