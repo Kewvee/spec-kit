@@ -2,9 +2,9 @@
 
 <!-- insert new changelog below this comment -->
 
-## [Unreleased]
+## [1.4.5-autopilot.2] - 2026-11-27
 
-> **Experimental.** Autopilot fixes from the automated review of the closed upstream PR (github/spec-kit#5588). The new workflow-engine tests were written but not run here (the project's test dependencies were not installed); the rest ran against a minimal pytest stand-in.
+> **Experimental.** Fork pre-release. Autopilot fixes from the automated review of the closed upstream PR (github/spec-kit#5588), and the design for team chat with Slack or Discord (`extensions/autopilot/design/team-chat.md`, not built yet). The new workflow-engine tests were written but not run here (the project's test dependencies were not installed); the rest ran against a minimal pytest stand-in.
 
 ### Changed
 
