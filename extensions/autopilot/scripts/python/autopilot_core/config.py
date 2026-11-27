@@ -86,6 +86,17 @@ DEFAULTS: dict[str, Any] = {
             ".kiro",
         ],
     },
+    # Team chat: the bridge mirrors the team's threads to one chat app and brings
+    # the product owner's replies back. Secrets never go here: the bot token comes
+    # from the environment variable named by token_env, or from
+    # ~/.config/specify/autopilot/<provider>-token.
+    "chat": {
+        "provider": "none",
+        "poll_seconds": 20,
+        "max_posts_per_minute": 20,
+        "slack": {"channel_id": "", "owner_id": "", "token_env": "SLACK_BOT_TOKEN"},
+        "discord": {"forum_channel_id": "", "owner_id": "", "token_env": "DISCORD_BOT_TOKEN"},
+    },
 }
 
 
@@ -240,6 +251,21 @@ def _validate(config: dict[str, Any], path: Path) -> None:
             raise ConfigError(f"{path}: run.{key} must be a string")
     if not config["run"]["specify_command"].strip():
         raise ConfigError(f"{path}: run.specify_command must not be empty")
+    chat = config["chat"]
+    if not isinstance(chat, dict) or chat.get("provider") not in ("none", "slack", "discord"):
+        raise ConfigError(f"{path}: chat.provider must be none, slack or discord")
+    for key in ("poll_seconds", "max_posts_per_minute"):
+        value = chat.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigError(f"{path}: chat.{key} must be a positive integer")
+    for provider, keys in (("slack", ("channel_id", "owner_id", "token_env")),
+                           ("discord", ("forum_channel_id", "owner_id", "token_env"))):
+        section = chat.get(provider)
+        if not isinstance(section, dict) or not all(isinstance(section.get(k, ""), str) for k in keys):
+            raise ConfigError(f"{path}: chat.{provider} must map {', '.join(keys)} to strings")
+        if any(str(v).startswith(("xoxb-", "xoxp-")) or len(str(v)) > 60 for v in section.values()):
+            raise ConfigError(f"{path}: chat.{provider} looks like it holds a token; tokens never go in config "
+                              f"(use the {section.get('token_env') or 'token_env'} variable or the token file)")
     sync = config["run"]["sync_paths"]
     if not isinstance(sync, list) or not all(isinstance(p, str) and p.strip() for p in sync):
         raise ConfigError(f"{path}: run.sync_paths must be a list of non-empty strings")
@@ -309,7 +335,7 @@ def _scalar(raw: str) -> Any:
         return True
     if lowered in ("false", "no", "off"):
         return False
-    if lowered in ("null", "~", "none"):
+    if value in ("null", "Null", "NULL", "~"):  # YAML nulls; "none" is a string, as in PyYAML
         return None
     if re.fullmatch(r"[-+]?\d+", value):
         return int(value)

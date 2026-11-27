@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import chat
 from . import spec as spec_mod
 from .config import configured_checks
 from .questions import open_blocking, questions_dir
@@ -460,7 +461,28 @@ def run_gate(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
     save_pipe(project_root, feature_dir, state)
     output["status"] = state["status"]
     output["reason"] = state["reason"]
+    _say_gate(project_root, state, iteration, checks, entry, output)
     return output
+
+
+def _say(project_root: Path, state: dict[str, Any], author: str, text: str, kind: str, **meta: Any) -> None:
+    """Add to this epic's thread. Summaries only: raw output stays in the gate report."""
+    chat.safe_post(chat.main_root(project_root), chat.pipe_thread(state), author, text, kind=kind,
+                   meta={"epic": state.get("epic_id"), **meta})
+
+
+def _say_gate(project_root: Path, state: dict[str, Any], iteration: int, checks: list[CheckResult],
+              entry: dict[str, Any], output: dict[str, Any]) -> None:
+    marks = ", ".join(f"{c.name} {'✓' if c.passed else '✗'}" for c in checks)
+    if output["checks_passed"]:
+        next_step = "independent review next" if output.get("review_args") else "passed"
+        text = f"Iteration {iteration}: gate green ({marks}), {next_step}."
+    else:
+        added = len(entry.get("appended_tasks") or [])
+        text = f"Iteration {iteration}: gate red ({marks})" + (f", {added} fix task(s) added." if added else ".")
+        if state["status"] in TERMINAL:
+            text += f" Pipe {state['status']}: {state['reason']}"
+    _say(project_root, state, "autopilot", text + f" Report: `{output['report']}`", "gate", iteration=iteration)
 
 
 # ── decide ───────────────────────────────────────────────────────────────────
@@ -517,6 +539,14 @@ def decide(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
         "blocking": len(blocking),
         "findings": len(review.get("findings", [])),
     }
+    if blocking:
+        listed = "\n".join(f"• ({f['severity']}) {f['summary']}" + (f" [{f['file']}]" if isinstance(f.get("file"), str) and f["file"] else "")
+                            for f in blocking[:10])
+        _say(project_root, state, "reviewer", f"Review of iteration {iteration}: {len(blocking)} blocking finding(s), "
+             f"sent back as fix tasks.\n{listed}", "review", iteration=iteration)
+    else:
+        _say(project_root, state, "reviewer", f"Review of iteration {iteration}: passed. {review.get('summary', '')}".strip(),
+             "review", iteration=iteration)
     if not blocking:
         if review["verdict"] == "fail":
             entry["review"]["note"] = "declared fail without blocker/major findings; treated as pass"

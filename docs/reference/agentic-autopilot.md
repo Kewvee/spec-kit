@@ -67,6 +67,7 @@ You drive the whole autopilot from your agent's chat:
 | `/speckit.autopilot.run` | The conductor: preflight, plan epics, **gate 1** (approve the plan in chat), start the unattended drive, **gate 2** (approve the final merge), land. Run it again at any time to continue an interrupted run. `stop` halts new pipes |
 | `/speckit.autopilot.status` | Read-only: stage, epic table, budget, recent events, and the evidence-based cause of any failure |
 | `/speckit.autopilot.recover` | Act as the human in the loop: diagnose failed or escalated epics, fix them with your approval, reset them and resume |
+| `/speckit.autopilot.chat` | Connect the team to Slack or Discord (one at a time), switch, disconnect, or check the connection |
 
 Used internally, and also callable on their own:
 
@@ -133,6 +134,42 @@ run:
 6. **Land.** Your approval is recorded (`approve land`), then the run's integration branch is merged into your base branch with a merge commit. If the base branch moved during the run, the combination is first merged and verified with every gate check in a scratch worktree, and the base branch only fast-forwards to that verified commit. It then offers to clean up epic branches and worktrees.
 
 To halt new work: `/speckit.autopilot.run stop` (running pipes finish). To check in: `/speckit.autopilot.status`.
+
+## Team chat (Slack or Discord)
+
+The team's conversation can be followed and steered from one chat app. Each run has a thread, and so does each epic. The epic threads carry the developer's questions, the lead's answers, gate and review results, decisions and merges. You reply there instead of in the agent chat. Set it up with `/speckit.autopilot.chat connect slack` (or `discord`).
+
+```text
+ developer / lead / reviewer / gate ──append──► journal (.specify/autopilot/threads/*.jsonl, in git)
+                                                   │ ▲
+                         agents read thread.md ◄───┘ │ your replies (only your account's)
+                                                     │
+                                         bridge (one process, no AI) ◄──► Slack channel | Discord forum
+```
+
+- **The journal is the memory.** Every message is appended to `.specify/autopilot/threads/` in the repository, without touching the network. A chat outage, a bad token or a rate limit never stops the team. Before every step, each developer reads its epic's thread as `context/thread.md`, together with your notes to the whole team.
+- **The bridge is the only network user.** `autopilot.py chat bridge` posts new journal messages and polls the active threads for your replies, every `chat.poll_seconds`. It starts by itself when a plan is checked or the drive starts, and stops once the run is over and everything is delivered.
+- **Only you count.** Replies are accepted only from `chat.<app>.owner_id`. Everyone else's messages, and bots', are ignored and never reach an agent.
+- **What you can say.** In the run thread:
+  - `approve plan <run-id>` or `reject plan <run-id> <why>`;
+  - `approve land <run-id>` or `reject land <run-id> <why>`;
+  - `stop`, `resume` and `status`.
+  
+  In an epic thread, a plain reply answers its open product question if there is exactly one; otherwise use `answer <question-id> <decision>`. Anything else is a note the developers must follow. Approvals need the exact phrase and the current run ID; a reaction or "ok" does not count.
+- **Summaries only.** Messages give the gate results per check and the reviewer's blocking findings in one line each. Raw test output, diffs and environment never leave the repository; messages name the report file instead.
+- **Flood guard.** At most `chat.max_posts_per_minute` posts per minute. A bigger backlog is folded into one digest message.
+- **Switching apps.** Change the provider with `/speckit.autopilot.chat connect <other>`. The new app's delivery state starts empty, so it posts nothing until you confirm `chat replay --confirm`, which posts the journal's history marked as replayed. The old app keeps its threads.
+
+| | Slack | Discord |
+| --- | --- | --- |
+| Where | one channel per project | one forum channel per project |
+| Thread | a header message (title + live status, edited in place) with replies | a forum post |
+| Speaker names | per message (`chat:write.customize`) | per message (a webhook on the forum) |
+| Live status | the header's status line | forum tags (`run`/`epic` plus `running`, `needs-owner`, `merged`, …) |
+| Hidden metadata | Slack message metadata on every message | none (the journal holds it) |
+| Commands outside a thread | yes, top-level messages go to the run thread | no, reply in a post |
+
+Secrets never go in the config. The bot token is read from the environment variable named by `chat.<app>.token_env`, or from `~/.config/specify/autopilot/<app>-token` (mode 600). The file is preferred, because an agent with shell access can read its own environment. Discord's speaker webhook is stored next to it. Put the IDs (`channel_id` / `forum_channel_id`, `owner_id`) in `local-config.yml`. Slack's free plan works: the journal keeps what Slack hides after 90 days. `autopilot.py chat status` (also part of `status`) reports the bridge, pending messages and the last error.
 
 ## Headless and CI
 
@@ -261,6 +298,8 @@ Configuration is layered like every extension's: `autopilot-config.yml`, then `l
 | `.specify/autopilot/log.jsonl`, `logs/` | Events and each pipe's CLI output |
 | `.specify/autopilot/report.md` | Run report shown at the final gate |
 | `.specify/autopilot/approvals.json` | The product owner's verdicts on both gates for the current run |
+| `.specify/autopilot/threads/` | The team journal: one thread per run and per epic (committed; the team's memory) |
+| `.specify/autopilot/chat/` | The bridge's delivery state, health and lock (local) |
 | `.specify/autopilot/runs/<run-id>/` | Earlier runs, archived by `new-run` |
 | `<worktree>/.specify/autopilot/pipes/<feature>/` | `pipe.json`, `gate-N.md`, `review-N.diff`, `review-N.json` |
 

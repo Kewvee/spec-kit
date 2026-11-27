@@ -361,7 +361,7 @@ def test_developers_work_with_team_context_and_share_decisions(make_project):
     # Every developer had the handbook, its brief and the decision log before its first step.
     for epic_id in ("E1", "E2", "E3"):
         seen = next((worktree[epic_id] / ".specify" / "workflows" / "runs").glob("*/context-seen.txt")).read_text()
-        assert seen.split() == ["decisions.md", "epic-context.md", "program.md"], (epic_id, seen)
+        assert seen.split() == ["decisions.md", "epic-context.md", "program.md", "thread.md"], (epic_id, seen)
 
     # The brief places the epic in the team.
     e3 = (worktree["E3"] / ".specify" / "autopilot" / "context" / "epic-context.md").read_text()
@@ -452,7 +452,13 @@ def test_a_landed_run_must_be_archived_before_the_next_plan(make_project):
     assert _cli(root, "drive")[0] == 0
     git(root, "add", ".specify")
     git(root, "commit", "-q", "-m", "install autopilot")
-    assert _cli(root, "approve", "land")[0] == 0
+    from autopilot_core import chat
+
+    chat.post(root, chat.run_thread(run), "owner", "Ship it.", kind="note")  # said after the last commit
+    code, out, _ = _cli(root, "approve", "land")
+    assert code == 0 and out["land"]["journal_commit"]
+    assert git(root, "log", "-1", "--format=%s") == f"autopilot: team journal for run {run}"
+    assert f".specify/autopilot/threads/{run}-E1.jsonl" in git(root, "ls-files")
     code, out, _ = _cli(root, "plan-check", "--reset")
     assert code == 1 and "new-run" in out["problems"][0]
     code, out, _ = _cli(root, "new-run")
@@ -476,7 +482,8 @@ def test_land_verifies_the_combination_when_the_base_moved(make_project):
     files = git(root, "ls-tree", "-r", "--name-only", "main").splitlines()
     assert "later.txt" in files and "src/alpha.txt" in files
     # main fast-forwarded to the verified merge; the scratch worktree is gone.
-    assert git(root, "rev-parse", "HEAD") == out["land"]["commit"]
+    head = git(root, "rev-parse", "HEAD")
+    assert head == out["land"]["commit"] or git(root, "rev-parse", "HEAD~1") == out["land"]["commit"]
     assert "_land" not in git(root, "worktree", "list")
 
 

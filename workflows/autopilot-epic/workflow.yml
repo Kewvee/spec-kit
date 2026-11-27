@@ -66,7 +66,7 @@ steps:
           args: |-
             {{ inputs.brief }}
 
-            TEAM CONTEXT: you are a developer on a team, working unattended. First read .specify/autopilot/context/epic-context.md, program.md and decisions.md (when present): the spec must fit the program's architecture, conventions, contracts and decisions. Every user story needs numbered acceptance scenarios under "**Acceptance Scenarios**:" in Given/When/Then form; they become the tests the gate requires. Where the requirements leave something open, choose the reasonable interpretation and record it under Assumptions; only where a wrong guess would be costly, leave a [NEEDS CLARIFICATION: <specific question>] marker, and the team lead will answer it. Nobody reads chat. If the git extension's feature-branch hook runs, the feature branch already exists and is checked out (GIT_BRANCH_NAME is set): reuse it with --allow-existing-branch.
+            TEAM CONTEXT: you are a developer on a team, working unattended. First read .specify/autopilot/context/epic-context.md, program.md, decisions.md and thread.md (when present; thread.md is your epic's conversation so far, including the product owner's notes): the spec must fit the program's architecture, conventions, contracts and decisions. Every user story needs numbered acceptance scenarios under "**Acceptance Scenarios**:" in Given/When/Then form; they become the tests the gate requires. Where the requirements leave something open, choose the reasonable interpretation and record it under Assumptions; only where a wrong guess would be costly, leave a [NEEDS CLARIFICATION: <specific question>] marker, and the team lead will answer it. Nobody reads chat. If the git extension's feature-branch hook runs, the feature branch already exists and is checked out (GIT_BRANCH_NAME is set): reuse it with --allow-existing-branch.
 
   - id: spec-consult
     type: shell
@@ -106,12 +106,12 @@ steps:
         command: speckit.plan
         integration: "{{ inputs.integration }}"
         input:
-          args: "TEAM CONTEXT: you are a developer on a team, working unattended. First read .specify/autopilot/context/epic-context.md, program.md and decisions.md: use the architecture, stack, conventions and contracts they define and the code your dependencies already built; stay within your epic's files and do not redesign what parallel teammates own. Record decisions and assumptions in research.md. For a costly-to-guess design question, write a question file for the team lead as epic-context.md explains, and plan around it. Nobody reads chat."
+          args: "TEAM CONTEXT: you are a developer on a team, working unattended. First read .specify/autopilot/context/epic-context.md, program.md, decisions.md and thread.md: use the architecture, stack, conventions and contracts they define and the code your dependencies already built; stay within your epic's files and do not redesign what parallel teammates own. Record decisions and assumptions in research.md. For a costly-to-guess design question, write a question file for the team lead as epic-context.md explains, and plan around it. Nobody reads chat."
       - id: tasks
         command: speckit.tasks
         integration: "{{ inputs.integration }}"
         input:
-          args: "TEAM CONTEXT: read .specify/autopilot/context/epic-context.md and decisions.md first. Tests are required: generate test tasks for every acceptance scenario. {{ steps.check-spec.output.data.tag_hint }}"
+          args: "TEAM CONTEXT: read .specify/autopilot/context/epic-context.md, decisions.md and thread.md first. Tests are required: generate test tasks for every acceptance scenario. {{ steps.check-spec.output.data.tag_hint }}"
 
   - id: design-consult
     type: shell
@@ -153,13 +153,13 @@ steps:
             command: speckit.implement
             integration: "{{ inputs.integration }}"
             input:
-              args: "TEAM CONTEXT: you are a developer on a team, working unattended; checklists were reviewed before this run. First read .specify/autopilot/context/epic-context.md, program.md and decisions.md and follow them; Team Decisions tasks carry the lead's answers to your questions. Complete every unchecked task in tasks.md, including Convergence, Team Decisions and Autopilot Remediation phases. Run the project's tests as you go and mark a task [X] only when it is done and verified. Never weaken, skip or delete a test to make it pass. Every acceptance test must keep its scenario ID (NNN-USx-ASy) in its name or a comment. Stay within your epic's files. When a wrong guess would be costly (a contract another epic uses, the data model, public behavior, security), write a question file for the team lead as epic-context.md explains, leave that task unchecked and continue with the rest. Never ask in chat."
+              args: "TEAM CONTEXT: you are a developer on a team, working unattended; checklists were reviewed before this run. First read .specify/autopilot/context/epic-context.md, program.md, decisions.md and thread.md and follow them; Team Decisions tasks carry the lead's answers to your questions. Complete every unchecked task in tasks.md, including Convergence, Team Decisions and Autopilot Remediation phases. Run the project's tests as you go and mark a task [X] only when it is done and verified. Never weaken, skip or delete a test to make it pass. Every acceptance test must keep its scenario ID (NNN-USx-ASy) in its name or a comment. Stay within your epic's files. When a wrong guess would be costly (a contract another epic uses, the data model, public behavior, security), write a question file for the team lead as epic-context.md explains, leave that task unchecked and continue with the rest. Never ask in chat."
 
           - id: converge
             command: speckit.converge
             integration: "{{ inputs.integration }}"
             input:
-              args: "TEAM CONTEXT: you are a developer on a team, working unattended. Before comparing the code with the feature artifacts, read .specify/autopilot/context/epic-context.md, program.md and decisions.md: the program's architecture, conventions, contracts between epics and every team decision are part of the intent too. Do not append tasks that contradict them or that belong to another epic's files. Nobody reads chat."
+              args: "TEAM CONTEXT: you are a developer on a team, working unattended. Before comparing the code with the feature artifacts, read .specify/autopilot/context/epic-context.md, program.md, decisions.md and thread.md: the program's architecture, conventions, contracts between epics and every team decision are part of the intent too. Do not append tasks that contradict them or that belong to another epic's files. Nobody reads chat."
 
           - id: consult
             type: shell

@@ -51,9 +51,11 @@ Treat the input as extra instructions (for example "lint is `make lint`, skip ty
 
 5. **Check autonomy conflicts.** If the project's agent instructions would stop an unattended pipe (for example a `CLAUDE.md` rule like "one skill per turn, then stop", or "always ask before editing"), show the rule and propose an exception scoped to autopilot runs. Edit it only with the user's yes.
 
-6. **Offer to commit.** Pipes run in git worktrees created from commits. List what this setup created or changed (`.specify/`, the agent's command or skill folder, the config, and any instruction-file edit) and ask whether to commit it. Commit only those paths, only with the user's yes, and never anything that looks like a secret.
+6. **Offer a team chat.** Ask whether the user wants to follow and steer the team from Slack or Discord (threads per epic, approvals and answers by reply). If yes, carry out `__SPECKIT_COMMAND_AUTOPILOT_CHAT__ connect <app>` now; otherwise mention it can be connected any time.
 
-7. **Report** a table of the configured checks with pass/fail, any `run.setup` command, the limits, and the next step: put requirements under `docs/requirements/` (or anywhere) and run `__SPECKIT_COMMAND_AUTOPILOT_RUN__`.
+7. **Offer to commit.** Pipes run in git worktrees created from commits. List what this setup created or changed (`.specify/`, the agent's command or skill folder, the config, and any instruction-file edit) and ask whether to commit it. Commit only those paths, only with the user's yes, and never anything that looks like a secret. `local-config.yml` stays uncommitted.
+
+8. **Report** a table of the configured checks with pass/fail, any `run.setup` command, the limits, and the next step: put requirements under `docs/requirements/` (or anywhere) and run `__SPECKIT_COMMAND_AUTOPILOT_RUN__`.
 
 ## Rules
 

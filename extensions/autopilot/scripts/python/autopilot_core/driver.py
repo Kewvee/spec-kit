@@ -35,9 +35,10 @@ from typing import Any
 
 import secrets as _secrets
 
+from . import chat
 from . import dag as dag_mod
 from . import team
-from .config import configured_checks, write_snapshot
+from .config import ConfigError, configured_checks, load_config, write_snapshot
 from .gate import LOOP_END, checks_only
 from .util import (
     GitError,
@@ -487,6 +488,8 @@ def run_pipe(root: Path, epic: dict[str, Any], config: dict[str, Any], integrati
         "SPECIFY_FEATURE": epic["branch"],
         "GIT_BRANCH_NAME": epic["branch"],
         "AUTOPILOT_EPIC": epic["id"],
+        # The run ID names the epic's thread in the team journal.
+        "AUTOPILOT_RUN": str(epic.get("_run", "")),
         "AUTOPILOT_BASE": epic["base_commit"] or "",
         # The lead's handbook and the shared decision log live in the main checkout.
         "AUTOPILOT_ROOT": str(root),
@@ -834,7 +837,7 @@ def _drive(root: Path, config: dict[str, Any], integration: str, pipe_runner) ->
                     # working in parallel now and the latest decisions.
                     team.write_epic_context(root, Path(epic["worktree"]), state, epic_id)
                     reserved[epic_id] = cost
-                    running[pool.submit(pipe_runner, root, dict(epic), config, integration)] = epic_id
+                    running[pool.submit(pipe_runner, root, dict(epic, _run=run_id(state)), config, integration)] = epic_id
                     log(root, "start", epic=epic_id, attempt=epic["attempts"], worktree=epic["worktree"])
                 save_state(root, state)
             if halted and halted != state.get("halted"):
@@ -961,7 +964,15 @@ def run_status(root: Path) -> dict[str, Any]:
         "questions_for_human": questions,
         **summary,
         "recent_events": [json.loads(line) for line in recent if line.strip()],
+        "chat": _chat_health(root),
     }
+
+
+def _chat_health(root: Path) -> dict[str, Any]:
+    try:
+        return chat.health(root, load_config(root))
+    except ConfigError as exc:
+        return {"error": str(exc)}
 
 
 def status_summary(state: dict[str, Any]) -> dict[str, Any]:
@@ -1076,7 +1087,24 @@ def land(root: Path, config: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     state["landed_commit"] = git(root, "rev-parse", "HEAD")
     save_state(root, state)
     log(root, "landed", run=run_id(state), commit=state["landed_commit"])
-    return 0, {"landed": True, "commit": state["landed_commit"], "epics": [e["id"] for e in merged]}
+    journal = _commit_journal(root, state)
+    return 0, {"landed": True, "commit": state["landed_commit"], "epics": [e["id"] for e in merged],
+               "journal_commit": journal}
+
+
+def _commit_journal(root: Path, state: dict[str, Any]) -> str | None:
+    """Record the team's conversation with the landed work (the threads are the team's memory)."""
+    threads = ".specify/autopilot/threads"
+    if not (root / threads).is_dir():
+        return None
+    git(root, "--literal-pathspecs", "add", "--", threads, check=False)
+    if git_ok(root, "diff", "--cached", "--quiet", "--", threads):
+        return None
+    if not git_ok(root, *identity_args(root), "commit", "-q", "-m",
+                  f"autopilot: team journal for run {run_id(state)}", "--", threads):
+        git(root, "reset", "-q", "--", threads, check=False)
+        return None
+    return git(root, "rev-parse", "HEAD")
 
 
 def _verified_candidate(

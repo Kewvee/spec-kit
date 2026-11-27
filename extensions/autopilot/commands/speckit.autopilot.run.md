@@ -75,6 +75,8 @@ Present the plan from `.specify/autopilot/dag.md`, `epics.md` and `program.md`:
 - Requirement coverage, assumptions, open questions and out-of-scope items.
 - The cost ceiling: worst case `epics × (3 + 3 × pipe.max_iterations)` agent calls against `run.max_agent_calls`, plus `run.max_parallel` and the time limits from `.specify/extensions/autopilot/autopilot-config.yml`.
 
+If a team chat is connected (`chat.provider` is not `none`; set up with `__SPECKIT_COMMAND_AUTOPILOT_CHAT__`), the plan is also posted in the run's thread there, and the user may approve in either place. An approval given in the chat app shows up as `approvals.plan` in `AP status`; do not record it twice.
+
 Then ask the user to **approve**, **change** something, or **cancel**. This gate is the user's decision:
 
 - Proceed only on an explicit approval given in this conversation, after the current plan was shown. Silence, "looks interesting" or approval of an earlier version is not approval.
@@ -88,7 +90,8 @@ Then ask the user to **approve**, **change** something, or **cancel**. This gate
 
 - the run is unattended from here and survives this chat;
 - each epic builds on branch `autopilot/<run-id>/NNN-slug` in a worktree beside the repository, and merges one at a time into the run's integration branch (`integration_branch` in `.specify/autopilot/state.json`), never into their branch;
-- they can check in at any time with `__SPECKIT_COMMAND_AUTOPILOT_STATUS__`, or halt new work with `__SPECKIT_COMMAND_AUTOPILOT_RUN__ stop`.
+- they can check in at any time with `__SPECKIT_COMMAND_AUTOPILOT_STATUS__`, or halt new work with `__SPECKIT_COMMAND_AUTOPILOT_RUN__ stop`;
+- with a team chat connected, every epic has a thread there to follow, and they can answer questions, stop the run or leave notes for the developers in the chat app instead of here. Without one, offer `__SPECKIT_COMMAND_AUTOPILOT_CHAT__` once.
 
 **Waiting loop.** If you can keep working in this session, check `AP status` every few minutes, using your environment's wait or sleep facility. Report only changes (an epic merged, escalated or blocked, a question for the product owner), not every poll. When `questions_for_human` is non-empty, go to **Answering questions** right away: the drive keeps the rest of the team working meanwhile. Leave the loop when `stage` is no longer `driving`. If you cannot wait in this session, end here and tell the user to run `__SPECKIT_COMMAND_AUTOPILOT_RUN__` again later. It will pick up at the right step.
 
@@ -100,7 +103,7 @@ A developer's question reaches the product owner only after you, as team lead, d
 
 1. Present it as a decision to make: the epic, the question, the developer's context, the options with consequences, and the lead's and the developer's recommendations (`lead_recommendation`, `developer_recommendation`) and the reason it is a product decision (`lead_why`).
 2. Ask the user to decide. They may pick an option or say something else. Do not answer for them.
-3. Record the decision with `AP answer <question id> --text "<the decision, stated so a developer can apply it>"`. It becomes a team decision that binds every epic.
+3. Record the decision with `AP answer <question id> --text "<the decision, stated so a developer can apply it>"`. It becomes a team decision that binds every epic, and it appears in the epic's thread. A question already answered in the team chat is no longer in `questions_for_human`.
 
 When all of an epic's questions are answered, the drive resumes that epic by itself if it is running. If no drive is running (`drive_running` false), continue with Step 5.
 
