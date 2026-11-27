@@ -41,11 +41,13 @@ Run `AP status`. Then act on `stage`:
 | --- | --- |
 | `no-plan`, `planned-unchecked` | Go to Step 2 |
 | `awaiting-plan-approval` | A checked plan exists that was never approved. Go to Step 4 (or Step 3 with `replan`) |
+| `plan-rejected` | The user rejected this plan (`approvals.plan.note` says why). Go to Step 3 with `replan`: revise `epics.json` / `program.md` and run `AP plan-check --reset`, which starts a new run ID |
 | `driving` | A drive is already running. Do **not** start another. Report progress as `__SPECKIT_COMMAND_AUTOPILOT_STATUS__` would, then go to Step 5's waiting loop |
 | `interrupted` | The drive stopped before finishing (machine slept, terminal closed). Tell the user, then resume with Step 5. Finished epics are never repeated |
 | `awaiting-human` | Developers are waiting on product-owner questions. Go to **Answering questions**, then Step 5 |
 | `awaiting-land`, `finished-nothing-merged` | Go to Step 6 |
-| `landed` | The previous run is complete. Starting a new one discards its scheduler state (branches and worktrees stay). Ask the user before running `AP plan-check --reset`, then continue at Step 2 |
+| `land-rejected` | The user held the final merge. Report it; offer `__SPECKIT_COMMAND_AUTOPILOT_RECOVER__` or a new run |
+| `landed` | The previous run is complete. A new run starts from fresh epics and a fresh handbook: ask the user, then run `AP new-run` (it archives the old run under `.specify/autopilot/runs/<run-id>/`; decisions stay) and continue at Step 2. Old branches and worktrees stay until the user agrees to remove them |
 
 If the input is `stop`, run `AP stop`, report what is still running (running pipes finish; no new ones start), and end. `AP unstop` reverses it.
 
@@ -76,15 +78,16 @@ Present the plan from `.specify/autopilot/dag.md`, `epics.md` and `program.md`:
 Then ask the user to **approve**, **change** something, or **cancel**. This gate is the user's decision:
 
 - Proceed only on an explicit approval given in this conversation, after the current plan was shown. Silence, "looks interesting" or approval of an earlier version is not approval.
-- On a change request: edit `epics.json` and/or `program.md`, rerun `AP plan-check`, and show the plan again.
-- On cancel: stop. Nothing has been created yet besides `.specify/autopilot/`.
+- On approval: record it with `AP approve plan --run <run_id>` (the `run_id` from `AP status`). This records the product owner's verdict and starts the drive detached; `drive` refuses to run without it. Then go to Step 5.
+- On a change request: edit `epics.json` and/or `program.md`, rerun `AP plan-check --reset` (a new run ID), and show the plan again.
+- On cancel: record it with `AP approve plan --reject --note "<why>"` and stop. Nothing has been created yet besides `.specify/autopilot/`.
 
 ## Step 5: Drive (unattended)
 
-Run `AP drive --detach`. It starts the scheduler in the background and returns immediately with its pid. Tell the user, in a few lines:
+`AP approve plan` already started the scheduler in the background. When resuming an interrupted run, run `AP drive --detach` (the approval from gate 1 still stands). Tell the user, in a few lines:
 
 - the run is unattended from here and survives this chat;
-- each epic builds on branch `autopilot/NNN-slug` in a worktree beside the repository, and merges one at a time into `autopilot/integration`, never into their branch;
+- each epic builds on branch `autopilot/<run-id>/NNN-slug` in a worktree beside the repository, and merges one at a time into the run's integration branch (`integration_branch` in `.specify/autopilot/state.json`), never into their branch;
 - they can check in at any time with `__SPECKIT_COMMAND_AUTOPILOT_STATUS__`, or halt new work with `__SPECKIT_COMMAND_AUTOPILOT_RUN__ stop`.
 
 **Waiting loop.** If you can keep working in this session, check `AP status` every few minutes, using your environment's wait or sleep facility. Report only changes (an epic merged, escalated or blocked, a question for the product owner), not every poll. When `questions_for_human` is non-empty, go to **Answering questions** right away: the drive keeps the rest of the team working meanwhile. Leave the loop when `stage` is no longer `driving`. If you cannot wait in this session, end here and tell the user to run `__SPECKIT_COMMAND_AUTOPILOT_RUN__` again later. It will pick up at the right step.
@@ -106,12 +109,12 @@ When all of an epic's questions are answered, the drive resumes that epic by its
 Run `AP report`, then present `.specify/autopilot/report.md`:
 
 - Per epic: status, iterations and note.
-- For the merged work: `git log --oneline <base>..autopilot/integration` and `git diff --stat <base>...autopilot/integration`.
+- For the merged work: `git log --oneline <base>..<integration>` and `git diff --stat <base>...<integration>`, with the integration branch from `.specify/autopilot/state.json`.
 - Every `failed`, `escalated` or `blocked` epic with its reason. Offer `__SPECKIT_COMMAND_AUTOPILOT_RECOVER__` to fix them before landing, or landing the merged epics now and recovering the rest later.
 
 If nothing merged, say so and stop. Otherwise ask the user to **approve the merge into the base branch** or **hold**. The same approval rules as gate 1 apply.
 
-On approval, run `AP land`. If it reports the wrong branch checked out or uncommitted changes, explain and ask before switching branches or committing. Report the landed commit and suggest deleting merged epic branches and worktrees (`git worktree remove`, `git branch -d`). Ask before doing it.
+On approval, run `AP approve land --run <run_id>`: it records the verdict and lands. If the base branch moved during the run, it first merges and verifies the combination in a scratch worktree and only fast-forwards to that verified commit. On hold, run `AP approve land --reject --note "<why>"`. If landing reports the wrong branch checked out or uncommitted changes, explain and ask before switching branches or committing. Report the landed commit and suggest deleting merged epic branches and worktrees (`git worktree remove`, `git branch -d`). Ask before doing it.
 
 ## Rules
 

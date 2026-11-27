@@ -19,7 +19,7 @@ Optional: an epic id (for example `E2`) to report on that epic in depth.
 1. Run `python3 .specify/extensions/autopilot/scripts/python/autopilot.py status` from the repository root (`python` where `python3` is unavailable) and read the JSON.
 
 2. Report, briefly:
-   - **Stage** in plain words: no plan yet; plan waiting for approval; running (with the drive's pid); interrupted (drive not running, work left); waiting for the final-merge approval; landed. Mention a pending stop request.
+   - **Stage** in plain words, with the run ID: no plan yet; plan waiting for approval; plan rejected; running (with the drive's pid); interrupted (drive not running, work left); waiting for the final-merge approval; final merge held; landed. Mention a pending stop request.
    - **Epics**: a table of id, status, iterations and a short note. Statuses mean: `pending` (waiting for dependencies or a free slot), `running`, `awaiting-human` (the developer asked a product question and waits; the others continue), `merged`, `failed` (cap or timeout), `escalated` (needs a human), `blocked` (a dependency did not merge).
    - **Questions for the product owner** (`questions_for_human`): each question with its options and the lead's recommendation. Say they are answered with `__SPECKIT_COMMAND_AUTOPILOT_RUN__`.
    - **Team decisions**: how many decisions `.specify/autopilot/decisions.md` holds, and the latest few in one line each.

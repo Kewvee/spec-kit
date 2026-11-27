@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -12,6 +13,7 @@ from tests.extensions.autopilot.helpers import EXT_DIR, SPEC_TEMPLATE
 from autopilot_core import config as config_mod
 from autopilot_core import dag
 from autopilot_core import spec as spec_mod
+from autopilot_core import util
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -77,6 +79,11 @@ def test_load_config_merges_over_defaults(tmp_path):
         "pipe:\n  max_iterations: true\n",
         "gate:\n  checks:\n    - run: pytest\n",
         "gate:\n  checks: pytest\n",
+        "pipe:\n  max_iterations: 30\n",
+        'gate:\n  acceptance:\n    test_globs: "tests/**"\n',
+        "gate:\n  acceptance: yes\n",
+        'gate:\n  acceptance:\n    test_globs: ["", "tests/**"]\n',
+        "run:\n  sync_paths: .claude\n",
     ],
 )
 def test_load_config_rejects_bad_values(tmp_path, text):
@@ -191,6 +198,8 @@ def test_parse_plan_accepts_valid_plan():
         ([_epic("E1", "a", ["E1"])], "depends on itself"),
         ([{**_epic("E1", "a"), "acceptance": []}], "acceptance"),
         ([_epic("E1", "a", ["E2"]), _epic("E2", "b", ["E1"])], "cycle"),
+        ([_epic("E1", "core\n")], "kebab-case"),
+        ([_epic("E1\n", "a")], "id"),
     ],
 )
 def test_parse_plan_rejects_invalid_plans(epics, problem):
@@ -258,3 +267,160 @@ def test_waves_and_feature_numbers(tmp_path):
         "E2": "specs/006-b",
         "E3": "specs/007-c",
     }
+
+
+# ── layered config ───────────────────────────────────────────────────────────
+
+
+def _install_config(root: Path, text: str) -> Path:
+    path = root / config_mod.CONFIG_RELATIVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_local_config_and_environment_override_the_project_config(tmp_path, monkeypatch):
+    _install_config(tmp_path, "pipe:\n  max_iterations: 4\nrun:\n  max_parallel: 2\n")
+    (tmp_path / config_mod.LOCAL_RELATIVE).write_text("run:\n  max_parallel: 3\n", encoding="utf-8")
+    config = config_mod.load_config(tmp_path)
+    assert config["pipe"]["max_iterations"] == 4 and config["run"]["max_parallel"] == 3
+    monkeypatch.setenv("SPECKIT_AUTOPILOT_RUN_MAX_PARALLEL", "5")
+    monkeypatch.setenv("SPECKIT_AUTOPILOT_GATE_ACCEPTANCE_TEST_GLOBS", '["spec/**"]')
+    monkeypatch.setenv("SPECKIT_AUTOPILOT_GATE_REQUIRE_REVIEW", "false")
+    config = config_mod.load_config(tmp_path)
+    assert config["run"]["max_parallel"] == 5
+    assert config["gate"]["acceptance"]["test_globs"] == ["spec/**"]
+    assert config["gate"]["require_review"] is False
+    monkeypatch.setenv("SPECKIT_AUTOPILOT_PIPE_MAX_ITERATIONS", "99")
+    with pytest.raises(config_mod.ConfigError):
+        config_mod.load_config(tmp_path)
+
+
+def test_pipes_read_the_run_snapshot(tmp_path, monkeypatch):
+    _install_config(tmp_path, "pipe:\n  max_iterations: 4\n")
+    stale = config_mod.load_config(tmp_path)
+    fresh = json.loads(json.dumps(stale))
+    fresh["pipe"]["max_iterations"] = 7
+    snapshot = config_mod.write_snapshot(fresh, tmp_path / "snap" / "run-config.json")
+    monkeypatch.setenv("AUTOPILOT_CONFIG", str(snapshot))
+    assert config_mod.load_config(tmp_path)["pipe"]["max_iterations"] == 7
+
+
+# ── git, locks and processes ─────────────────────────────────────────────────
+
+
+def _repo(tmp_path: Path) -> Path:
+    from tests.extensions.autopilot.helpers import init_repo
+
+    return init_repo(tmp_path / "repo")
+
+
+def _staged(root: Path) -> set[str]:
+    from tests.extensions.autopilot.helpers import git
+
+    return set(git(root, "diff", "--cached", "--name-only").splitlines())
+
+
+def test_dirty_paths_keeps_the_first_status_column(tmp_path):
+    from tests.extensions.autopilot.helpers import git
+
+    root = _repo(tmp_path)
+    report = root / ".specify" / "autopilot" / "report.md"
+    report.parent.mkdir(parents=True)
+    report.write_text("v1\n", encoding="utf-8")
+    git(root, "add", "-f", str(report.relative_to(root)))
+    git(root, "commit", "-q", "-m", "tracked report")
+    report.write_text("v2\n", encoding="utf-8")  # " M .specify/..." is the first status line
+    assert util.dirty_paths(root) == []
+    (root / "odd name.txt").write_text("x", encoding="utf-8")
+    assert util.dirty_paths(root) == ["odd name.txt"]
+
+
+def test_staging_takes_file_names_literally_and_skips_only_copied_setup(tmp_path):
+    root = _repo(tmp_path)
+    (root / ".claude").mkdir()
+    (root / ".claude" / "a.txt").write_text("copied setup", encoding="utf-8")
+    (root / ".claude" / "[ab].txt").write_text("new deliverable", encoding="utf-8")
+    (root / ".github" / "skills" / "new").mkdir(parents=True)
+    (root / ".github" / "skills" / "new" / "SKILL.md").write_text("deliverable", encoding="utf-8")
+    util.record_synced(root, {".claude/a.txt"})
+    util.stage_changes(root, [".claude", ".github/skills"])
+    assert _staged(root) == {".claude/[ab].txt", ".github/skills/new/SKILL.md"}
+
+
+def test_staging_unstages_runtime_files_an_agent_added(tmp_path):
+    from tests.extensions.autopilot.helpers import git
+
+    root = _repo(tmp_path)
+    (root / ".specify").mkdir()
+    (root / ".specify" / "feature.json").write_text('{"feature_directory": "specs/001-a"}', encoding="utf-8")
+    git(root, "add", ".specify/feature.json")
+    git(root, "commit", "-q", "-m", "tracked selector")
+    (root / ".specify" / "feature.json").write_text('{"feature_directory": "specs/002-b"}', encoding="utf-8")
+    runs = root / ".specify" / "workflows" / "runs" / "x"
+    runs.mkdir(parents=True)
+    (runs / "state.json").write_text("{}", encoding="utf-8")
+    (root / "work.py").write_text("x = 1\n", encoding="utf-8")
+    git(root, "add", "-A")  # an agent's broad staging
+    util.stage_changes(root)
+    assert _staged(root) == {"work.py"}
+    assert util.commit_all(root, "work") is True
+    assert util.runtime_paths_between(root, "HEAD~1", "HEAD") == []
+
+
+def test_fingerprint_sees_commits_but_not_runtime_state(tmp_path):
+    from tests.extensions.autopilot.helpers import git
+
+    root = _repo(tmp_path)
+    (root / "pending.py").write_text("pending\n", encoding="utf-8")
+    before = util.tree_fingerprint(root)
+    runs = root / ".specify" / "workflows" / "runs" / "x"
+    runs.mkdir(parents=True)
+    (runs / "state.json").write_text('{"step": 3}', encoding="utf-8")
+    assert util.tree_fingerprint(root) == before
+    (root / "README.md").write_text("edited by the reviewer\n", encoding="utf-8")
+    git(root, "commit", "-q", "-am", "sneaky commit")
+    assert util.tree_fingerprint(root) != before
+
+
+def test_process_lock_is_exclusive_and_dies_with_its_holder(tmp_path):
+    import subprocess
+    import sys
+    import time
+
+    path = tmp_path / "drive.lock"
+    first = util.ProcessLock(path)
+    first.acquire()
+    with pytest.raises(util.LockHeld):
+        util.ProcessLock(path).acquire()
+    first.release()
+    assert util.ProcessLock(path).owner() is None
+    script = (
+        "import sys, time; sys.path.insert(0, sys.argv[1]); from autopilot_core.util import ProcessLock; "
+        "ProcessLock(__import__('pathlib').Path(sys.argv[2])).acquire(); print('held', flush=True); time.sleep(60)"
+    )
+    from tests.extensions.autopilot.helpers import SCRIPTS_DIR
+
+    child = subprocess.Popen([sys.executable, "-c", script, str(SCRIPTS_DIR), str(path)], stdout=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == "held"
+    assert util.ProcessLock(path).owner()["pid"] == child.pid
+    child.kill()
+    child.wait()
+    time.sleep(0.1)
+    assert util.ProcessLock(path).owner() is None  # the OS released it: no stale owner
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX process groups")
+def test_timeout_kills_the_whole_process_tree(tmp_path):
+    import os
+    import time
+
+    pid_file = tmp_path / "child.pid"
+    result = util.run(f"sleep 60 & echo $! > '{pid_file}'; wait", tmp_path, shell=True, timeout=1)
+    assert result.returncode == -1
+    child = int(pid_file.read_text())
+    for _ in range(50):
+        if not util.pid_alive(child):
+            break
+        time.sleep(0.1)
+    assert not util.pid_alive(child)

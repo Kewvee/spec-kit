@@ -2,6 +2,56 @@
 
 <!-- insert new changelog below this comment -->
 
+## [Unreleased]
+
+> **Experimental.** Autopilot fixes from the automated review of the closed upstream PR (github/spec-kit#5588). The new workflow-engine tests were written but not run here (the project's test dependencies were not installed); the rest ran against a minimal pytest stand-in.
+
+### Changed
+
+- Autopilot gates are enforced in code. `approve plan|land` records the product owner's verdict for the current run in `.specify/autopilot/approvals.json`. `drive` refuses an unapproved or rejected plan, and `land` refuses without an approved final merge. The headless `autopilot` workflow records both gate verdicts.
+- Every planned run has a run ID. Branches, the integration branch and worktrees are per run (`autopilot/{run}/...`, configurable), so a re-plan never reuses an earlier run's work. `new-run` archives a finished run before the next one is planned.
+- Configuration is layered like other extensions: `autopilot-config.yml`, then `local-config.yml`, then `SPECKIT_AUTOPILOT_<SECTION>_<KEY>` environment variables. Pipes read a snapshot of the conductor's current configuration.
+
+### Fixed
+
+- Autopilot scheduler:
+  - The drive lock is an exclusive OS lock, so two drives can't both run and a crashed drive leaves no stale lock.
+  - Timeouts kill a pipe's whole process tree.
+  - Orphaned pipe processes are stopped before relaunching.
+  - A checkpoint left "running" starts a fresh run, since the workflow engine can't resume it.
+  - A withdrawn stop request no longer ends the run.
+  - A budget shortfall waits for running pipes before halting.
+  - Every attempt is charged to the budget.
+  - Failed worktree setup is retried.
+  - Pipes run with `SPECIFY_INIT_DIR` set to their worktree.
+- Autopilot landing: a base branch that moved during the run is verified, merged with the integration branch, in a scratch worktree before landing. Untracked setup files no longer block landing.
+- Autopilot git handling:
+  - `git status` is parsed with `-z`, so the leading-space trimming bug is gone.
+  - New files are staged with literal pathspecs.
+  - Runtime files an agent staged are unstaged, and a branch carrying them is not merged.
+  - Only the files the scheduler actually copied in are excluded, so new deliverables under `.github/skills/` are committed.
+  - `.specify/feature.json` stays out of commits.
+  - Rebases use `--autostash`.
+- Autopilot fingerprints, which detect edits by the lead or reviewer, now include `HEAD` and ignore workflow checkpoints and autopilot state.
+- Autopilot gate:
+  - A pipe with no configured checks can't pass.
+  - An unanswered blocking question keeps the gate red without counting as a stuck loop.
+  - Every user story needs an acceptance scenario.
+  - `check-spec` keeps the reason a dead pipe failed.
+  - `pipe.max_iterations` is capped at the workflow's ceiling of 25.
+  - Acceptance settings are validated.
+- Autopilot team:
+  - Lead-chosen decision IDs are never used as paths.
+  - Unreadable question files escalate.
+  - Half-written answers count as unanswered.
+  - Epic-scoped answers bind only their epic.
+  - The first published answer wins for the same question.
+  - Every identical spec marker is resolved.
+  - Context is refreshed right after answers are recorded.
+  - The `converge` step gets the team context.
+  - Answering a standalone pipe's question reopens that pipe.
+- Epic IDs and slugs are validated with full matches, so a trailing newline is rejected.
+
 ## [1.4.5-autopilot.1] - 2026-11-25
 
 > **Experimental.** Fork pre-release on top of `1.4.5.dev0`. The autopilot's interfaces, file formats and defaults may change without notice. Its tests have run against a minimal pytest stand-in only, not the project's full CI environment, and it has not yet been run against a real agent CLI.

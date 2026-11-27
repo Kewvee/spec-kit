@@ -32,7 +32,18 @@ from typing import Any
 
 from . import spec as spec_mod
 from .gate import LOOP_END, _rel, ensure_pipe, pipe_dir, save_pipe
-from .util import ensure_state_dir, now_iso, read_json, tree_fingerprint, write_json
+from .questions import answered as _answered
+from .questions import load_questions
+from .questions import needs_human as _needs_human
+from .util import (
+    ProcessLock,
+    ensure_state_dir,
+    now_iso,
+    read_json_lenient,
+    safe_id,
+    tree_fingerprint,
+    write_json,
+)
 
 CONTEXT_DIR = Path(".specify") / "autopilot" / "context"
 INBOX_DIR = Path(".specify") / "autopilot" / "inbox" / "questions"
@@ -85,10 +96,18 @@ def load_decisions(root: Path) -> list[dict[str, Any]]:
     directory = _decisions_dir(root)
     decisions = []
     for path in sorted(directory.glob("*.json")):
-        data = read_json(path)
-        if isinstance(data, dict):
+        data = read_json_lenient(path)
+        if isinstance(data, dict) and isinstance(data.get("id"), str) and isinstance(data.get("question"), str):
             decisions.append(data)
     return sorted(decisions, key=lambda d: (d.get("at", ""), d.get("id", "")))
+
+
+def decisions_for(root: Path, epic_id: str | None) -> list[dict[str, Any]]:
+    """Decisions that bind one epic: program-wide ones plus its own epic-scoped ones."""
+    return [
+        d for d in load_decisions(root)
+        if d.get("scope", "program") != "epic" or (epic_id is not None and d.get("epic") == epic_id)
+    ]
 
 
 def render_decisions(decisions: list[dict[str, Any]]) -> str:
@@ -102,8 +121,10 @@ def render_decisions(decisions: list[dict[str, Any]]) -> str:
     if not decisions:
         lines.append("_No decisions yet._")
     for decision in decisions:
+        scope = " · this epic only" if decision.get("scope") == "epic" else ""
         lines += [
-            f"## {decision['id']} ({decision.get('epic') or 'standalone'}, decided by {decision.get('decided_by', 'lead')})",
+            f"## {decision['id']} ({decision.get('epic') or 'standalone'}, decided by "
+            f"{decision.get('decided_by', 'lead')}{scope})",
             "",
             f"**Question:** {decision['question']}",
             "",
@@ -115,9 +136,23 @@ def render_decisions(decisions: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def publish_decision(root: Path, decision: dict[str, Any]) -> None:
-    write_json(_decisions_dir(root) / f"{decision['id']}.json", decision)
-    (ensure_state_dir(root) / "decisions.md").write_text(render_decisions(load_decisions(root)), encoding="utf-8")
+def publish_decision(root: Path, decision: dict[str, Any]) -> dict[str, Any]:
+    """Publish a decision unless the same question is already decided; return the one in force.
+
+    Parallel developers can ask the same question and get answers from separate
+    lead calls. The check and the write happen under one lock, so the first
+    answer published wins and later ones adopt it instead of contradicting it.
+    """
+    if not safe_id(decision.get("id")):
+        raise TeamError(f"unsafe decision ID {decision.get('id')!r}")
+    key = _normalise_question(decision["question"])
+    with ProcessLock(_decisions_dir(root) / ".lock"):
+        for existing in decisions_for(root, decision.get("epic")):
+            if existing["id"] == decision["id"] or _normalise_question(existing["question"]) == key:
+                return existing
+        write_json(_decisions_dir(root) / f"{decision['id']}.json", decision)
+        (ensure_state_dir(root) / "decisions.md").write_text(render_decisions(load_decisions(root)), encoding="utf-8")
+    return decision
 
 
 def _normalise_question(text: str) -> str:
@@ -127,15 +162,16 @@ def _normalise_question(text: str) -> str:
 # ── context ──────────────────────────────────────────────────────────────────
 
 
-def refresh_context(project_root: Path) -> Path:
-    """Copy the lead's handbook and the live decision log into this checkout."""
+def refresh_context(project_root: Path, epic_id: str | None = None) -> Path:
+    """Copy the lead's handbook and the decisions binding this epic into this checkout."""
     target = project_root / CONTEXT_DIR
     target.mkdir(parents=True, exist_ok=True)
     root = main_root(project_root)
+    epic_id = epic_id or os.environ.get("AUTOPILOT_EPIC", "").strip() or None
     program = ensure_state_dir(root) / "program.md"
     if program.is_file():
         (target / "program.md").write_text(program.read_text(encoding="utf-8"), encoding="utf-8")
-    (target / "decisions.md").write_text(render_decisions(load_decisions(root)), encoding="utf-8")
+    (target / "decisions.md").write_text(render_decisions(decisions_for(root, epic_id)), encoding="utf-8")
     if not (target / "epic-context.md").is_file():
         # Standalone pipe: no conductor wrote an assignment, but the channel still works.
         (target / "epic-context.md").write_text(
@@ -203,7 +239,7 @@ def write_epic_context(root: Path, worktree: Path, state: dict[str, Any], epic_i
     # The handbook and the decisions must be there before the first step (specify) runs.
     if program.is_file():
         (target / "program.md").write_text(program.read_text(encoding="utf-8"), encoding="utf-8")
-    (target / "decisions.md").write_text(render_decisions(load_decisions(root)), encoding="utf-8")
+    (target / "decisions.md").write_text(render_decisions(decisions_for(root, epic_id)), encoding="utf-8")
 
 
 # ── questions ────────────────────────────────────────────────────────────────
@@ -215,34 +251,11 @@ def _questions_dir(project_root: Path, feature_dir: Path) -> Path:
     return path
 
 
-def load_questions(qdir: Path) -> list[dict[str, Any]]:
-    questions = []
-    for path in sorted(qdir.glob("*.json")):
-        if path.name.endswith(".answer.json"):
-            continue
-        data = read_json(path)
-        if isinstance(data, dict) and data.get("id"):
-            answer = read_json(qdir / f"{data['id']}.answer.json")
-            data["answer"] = answer if isinstance(answer, dict) else None
-            questions.append(data)
-    return questions
-
-
-def _answered(question: dict[str, Any]) -> bool:
-    answer = question.get("answer")
-    return isinstance(answer, dict) and isinstance(answer.get("answer"), str) and bool(answer["answer"].strip())
-
-
-def _needs_human(question: dict[str, Any]) -> bool:
-    answer = question.get("answer")
-    return isinstance(answer, dict) and answer.get("needs_human") is True and not _answered(question)
-
-
 def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, Any]:
     """File new questions (inbox + spec markers); answer repeats from the decision log."""
     feature_dir = spec_mod.resolve_feature_dir(project_root)
     state = ensure_pipe(project_root, config, feature_dir)
-    refresh_context(project_root)
+    refresh_context(project_root, state.get("epic_id"))
     if state["status"] in LOOP_END:
         return {"open": 0, "finished": True, "status": state["status"], "lead_args": ""}
     flush_pending(project_root, config)  # decisions made before tasks.md existed
@@ -272,7 +285,7 @@ def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str,
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if not isinstance(data, dict) or not isinstance(data.get("question"), str) or not data["question"].strip():
                     raise ValueError("needs a non-empty 'question' string")
-            except (ValueError, json.JSONDecodeError) as exc:
+            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 problems.append(f"{path.name}: {exc}")
                 path.rename(path.with_suffix(".invalid"))
                 continue
@@ -288,8 +301,20 @@ def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str,
             })
             path.unlink()
 
+    if problems:
+        # A question the developer could not express is still a question: an epic
+        # must not pass with it silently dropped. A human repairs it and resets the epic.
+        state.update(status="escalated", reason="the developer wrote question file(s) that cannot be read ("
+                     + "; ".join(problems) + "); fix them in " + _rel(project_root, inbox)
+                     + " (renamed to .invalid) and reset the epic", finished_at=now_iso())
+        save_pipe(project_root, feature_dir, state)
+        return {"open": 0, "finished": True, "status": state["status"], "lead_args": "", "problems": problems}
+
     # A question the team already answered gets the logged answer, no lead call.
-    decisions = {_normalise_question(d["question"]): d for d in load_decisions(main_root(project_root))}
+    decisions = {
+        _normalise_question(d["question"]): d
+        for d in decisions_for(main_root(project_root), state.get("epic_id"))
+    }
     questions = load_questions(qdir)
     for question in questions:
         if question.get("answer") is None:
@@ -350,21 +375,31 @@ def record(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, 
             continue
         if _answered(question):
             answer = question["answer"]
-            decision_id = answer.get("decision_id") or f"D-{question['id']}"
-            if answer.get("decided_by") != "decision-log":
-                publish_decision(root, {
-                    "id": decision_id, "epic": state.get("epic_id"), "question": question["question"],
-                    "answer": answer["answer"].strip(), "rationale": str(answer.get("rationale", "")),
-                    "decided_by": answer.get("decided_by", "lead"), "at": now_iso(),
+            text = answer["answer"].strip()
+            if answer.get("decided_by") == "decision-log" and safe_id(answer.get("decision_id")):
+                decision_id = answer["decision_id"]
+            else:
+                # Decision IDs become file names: only our own, derived from the question ID.
+                decision_id = f"D-{question['id']}"
+                scope = "epic" if answer.get("applies_to") == "epic" and state.get("epic_id") else "program"
+                in_force = publish_decision(root, {
+                    "id": decision_id, "epic": state.get("epic_id"), "scope": scope,
+                    "question": question["question"], "answer": text,
+                    "rationale": str(answer.get("rationale", "")),
+                    "decided_by": str(answer.get("decided_by", "lead")), "at": now_iso(),
                 })
+                if in_force["id"] != decision_id:
+                    # A teammate's identical question was decided first: follow that decision.
+                    decision_id, text = in_force["id"], in_force["answer"]
             if question.get("origin") == "spec" and spec_path.is_file() and question.get("marker"):
-                text = spec_path.read_text(encoding="utf-8")
-                resolved = f"{question['question']} — **Decided ({decision_id}):** {answer['answer'].strip()}"
-                spec_path.write_text(text.replace(question["marker"], resolved, 1), encoding="utf-8")
+                spec_text = spec_path.read_text(encoding="utf-8")
+                resolved = f"{question['question']} — **Decided ({decision_id}):** {text}"
+                # Identical markers share one question ID: resolve every occurrence.
+                spec_path.write_text(spec_text.replace(question["marker"], resolved), encoding="utf-8")
             else:
                 tasks.append(
                     f"Apply team decision {decision_id} to your work (your question {question['id']}: "
-                    f"{question['question']}): {answer['answer'].strip()}"
+                    f"{question['question']}): {text}"
                 )
             question["applied"] = True
             applied.append(question["id"])
@@ -390,6 +425,8 @@ def record(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, 
         state.update(status="awaiting-human", reason="waiting for the product owner: "
                      + "; ".join(f"{q['id']}: {q['question']}" for q in waiting))
     save_pipe(project_root, feature_dir, state)
+    # The next developer step must already see the decisions just made.
+    refresh_context(project_root, state.get("epic_id"))
     return {
         "finished": state["status"] in LOOP_END,
         "status": state["status"],
@@ -402,7 +439,7 @@ def record(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, 
 def _carry_forward(qdir: Path, tasks: list[str]) -> None:
     """Before tasks.md exists, park decisions for the tasks step via the context."""
     pending = qdir.parent / "pending-decisions.json"
-    existing = read_json(pending, []) or []
+    existing = read_json_lenient(pending, []) or []
     write_json(pending, existing + tasks)
 
 
@@ -410,7 +447,7 @@ def flush_pending(project_root: Path, config: dict[str, Any]) -> list[str]:
     """Append decisions recorded before tasks.md existed (called by the gate)."""
     feature_dir = spec_mod.resolve_feature_dir(project_root)
     pending = pipe_dir(project_root, feature_dir) / "pending-decisions.json"
-    items = read_json(pending, []) or []
+    items = read_json_lenient(pending, []) or []
     if not items or not (feature_dir / "tasks.md").is_file():
         return []
     ids = spec_mod.append_task_phase(feature_dir / "tasks.md", "Team Decisions (before tasks)", items)
@@ -447,12 +484,45 @@ def answer_question(worktrees: list[tuple[str | None, Path]], question_id: str, 
     """Record the product owner's answer. The drive picks it up and resumes the epic."""
     if not text.strip():
         raise TeamError("the answer is empty")
+    if not safe_id(question_id):
+        raise TeamError(f"invalid question ID {question_id!r}")
     for question in open_human_questions(worktrees):
         if question["id"] == question_id:
-            write_json(Path(question["path"]), {"answer": text.strip(), "decided_by": "product owner",
-                                                "rationale": "Answered by the product owner."})
-            return {"ok": True, "id": question_id, "epic": question["epic"]}
+            answer_path = Path(question["path"])
+            write_json(answer_path, {"answer": text.strip(), "decided_by": "product owner",
+                                     "rationale": "Answered by the product owner."})
+            result: dict[str, Any] = {"ok": True, "id": question_id, "epic": question["epic"]}
+            if question["epic"] is None:
+                result.update(_reopen_standalone(answer_path.parent))
+            return result
     raise TeamError(f"no open question {question_id} waiting for the product owner")
+
+
+def _reopen_standalone(qdir: Path) -> dict[str, Any]:
+    """A pipe outside a conductor run: reopen it once every product question is answered.
+
+    In a planned run the scheduler does this and relaunches the epic. A
+    standalone pipe has no scheduler, so the answer reopens it here and says how
+    to continue: a new workflow run that starts at the first missing artifact
+    (resuming the old run would only replay its finished result step).
+    """
+    pipe_file = qdir.parent / "pipe.json"
+    pipe = read_json_lenient(pipe_file)
+    if not isinstance(pipe, dict) or pipe.get("status") != "awaiting-human":
+        return {}
+    if any(_needs_human(q) for q in load_questions(qdir)):
+        return {"reopened": False, "still_waiting": [q["id"] for q in load_questions(qdir) if _needs_human(q)]}
+    pipe.update(status="running", reason="answered by the product owner")
+    pipe.setdefault("history", []).append({"reopened": True, "at": now_iso()})
+    write_json(pipe_file, pipe)
+    project_root = qdir.parents[4]
+    feature = project_root / str(pipe.get("feature_dir", ""))
+    phase = "build" if (feature / "tasks.md").is_file() else "design" if (feature / "spec.md").is_file() else "full"
+    return {
+        "reopened": True,
+        "next": f"specify workflow run autopilot-epic --input phase={phase} "
+                f"(with SPECIFY_FEATURE_DIRECTORY={pipe.get('feature_dir')})",
+    }
 
 
 def all_answered(worktree: Path, feature_dir: str) -> bool:

@@ -86,7 +86,7 @@ def test_every_developer_step_reads_the_team_context_and_every_consult_has_a_lea
 def test_conductor_has_human_gates_on_plan_and_final_merge_only():
     definition = _load("autopilot")
     ids = [s["id"] for s in definition.steps]
-    assert ids == ["preflight", "plan-epics", "check-plan", "review-epics", "drive", "report", "review-land", "land"]
+    assert ids == ["preflight", "plan-epics", "check-plan", "review-epics", "approve-plan", "drive", "report", "review-land", "land"]
     gates = [s for s in definition.steps if s.get("type") == "gate"]
     assert [g["id"] for g in gates] == ["review-epics", "review-land"]
     for gate in gates:

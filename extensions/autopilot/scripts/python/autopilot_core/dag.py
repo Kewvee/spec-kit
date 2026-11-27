@@ -83,14 +83,14 @@ def parse_plan(data: Any) -> list[Epic]:
         epic_id = raw.get("id")
         slug = raw.get("slug")
         title = raw.get("title")
-        if not isinstance(epic_id, str) or not ID_RE.match(epic_id):
+        if not isinstance(epic_id, str) or not ID_RE.fullmatch(epic_id):
             problems.append(f"{where}.id must match {ID_RE.pattern}")
             continue
         where = f"epic {epic_id}"
         if epic_id in seen_ids:
             problems.append(f"{where}: duplicate id")
         seen_ids.add(epic_id)
-        if not isinstance(slug, str) or not SLUG_RE.match(slug):
+        if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
             problems.append(f"{where}: slug must be lowercase kebab-case, 1-50 chars")
             slug = ""
         elif slug in seen_slugs:
