@@ -25,6 +25,7 @@ Optional: an epic id (for example `E2`) to report on that epic in depth.
    - **Team decisions**: how many decisions `.specify/autopilot/decisions.md` holds, and the latest few in one line each.
    - **Budget**: `agent_calls_used` against `run.max_agent_calls` from `.specify/extensions/autopilot/autopilot-config.yml`, and any `halted` reason.
    - **Recent events**: only the meaningful ones (start, merged, escalated, blocked, retry, halt).
+   - **Team chat** (`chat`): when a provider is connected, whether the bridge runs, `pending` messages, and any `last_error` (a credentials or permission problem stops delivery; `__SPECKIT_COMMAND_AUTOPILOT_CHAT__ check` explains the fix). Mention approvals given in chat (`approvals`).
 
 3. For each `failed` or `escalated` epic, or the epic named in the input, explain **why** from the evidence. Do not guess.
    - The epic's worktree is in `.specify/autopilot/state.json` under `epics.<id>.worktree`. Its pipe files are in `<worktree>/.specify/autopilot/pipes/<feature-dir-name>/`. Read `pipe.json`, the latest `gate-N.md`, and `review-N.json` if present.

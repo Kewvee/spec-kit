@@ -33,6 +33,7 @@ def safe_id(value: Any) -> bool:
 STATE_GITIGNORE = (
     "# Autopilot run state is local to this checkout.\n*\n"
     "!.gitignore\n!epics.json\n!epics.md\n!dag.md\n!report.md\n"
+    "# The team journal is the team's memory: it is committed.\n!threads/\n!threads/*.jsonl\n"
 )
 
 
@@ -43,6 +44,9 @@ def ensure_state_dir(project_root: Path) -> Path:
     ignore = path / ".gitignore"
     if not ignore.exists():
         ignore.write_text(STATE_GITIGNORE, encoding="utf-8")
+    elif "!threads/" not in (current := ignore.read_text(encoding="utf-8")):
+        # Written by an earlier version: let the journal through as well.
+        ignore.write_text(current.rstrip("\n") + "\n!threads/\n!threads/*.jsonl\n", encoding="utf-8")
     return path
 
 

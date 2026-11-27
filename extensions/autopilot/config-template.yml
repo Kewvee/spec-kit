@@ -73,3 +73,26 @@ run:
   lead_model: ""
   # Untracked or ignored paths copied into each worktree when missing there.
   sync_paths: [".specify", ".claude", ".github/agents", ".github/prompts", ".github/skills", ".gemini", ".codex", ".opencode", ".agents", ".cursor", ".windsurf", ".kiro"]
+
+chat:
+  # Team chat (Slack or Discord): every epic gets a thread you can follow and
+  # reply in; the run thread carries the plan and the final report, and you
+  # approve both gates there with an exact written reply. none: off.
+  # Set up with /speckit.autopilot.chat. Never put a token in this file.
+  provider: none
+  poll_seconds: 20
+  max_posts_per_minute: 20
+  slack:
+    # The channel's ID (C0123ABCD). A public channel keeps Slack's export possible.
+    channel_id: ""
+    # Your Slack member ID (U0123ABCD): only your messages count.
+    owner_id: ""
+    # Environment variable holding the bot token (or ~/.config/specify/autopilot/slack-token).
+    token_env: SLACK_BOT_TOKEN
+  discord:
+    # The project's forum channel ID.
+    forum_channel_id: ""
+    # Your numeric Discord user ID: only your messages count.
+    owner_id: ""
+    # Environment variable holding the bot token (or ~/.config/specify/autopilot/discord-token).
+    token_env: DISCORD_BOT_TOKEN

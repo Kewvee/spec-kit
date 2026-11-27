@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from . import chat
 from . import spec as spec_mod
 from .gate import LOOP_END, _rel, ensure_pipe, pipe_dir, save_pipe
 from .questions import answered as _answered
@@ -72,6 +73,8 @@ the question does not block:
 
 Never ask in chat: nobody is reading it. The lead's answers come back as tasks in
 tasks.md (and edits to spec.md for spec questions) and appear in decisions.md.
+Your question and the answer also appear in thread.md, your epic's conversation,
+which the product owner can follow and comment on.
 """
 
 
@@ -80,9 +83,8 @@ class TeamError(RuntimeError):
 
 
 def main_root(project_root: Path) -> Path:
-    """The conductor's checkout (shared decision log); this checkout when standalone."""
-    raw = os.environ.get("AUTOPILOT_ROOT", "").strip()
-    return Path(raw) if raw else project_root
+    """The conductor's checkout (shared decision log and journal); this checkout when standalone."""
+    return chat.main_root(project_root)
 
 
 # ── decision log ─────────────────────────────────────────────────────────────
@@ -162,8 +164,8 @@ def _normalise_question(text: str) -> str:
 # ── context ──────────────────────────────────────────────────────────────────
 
 
-def refresh_context(project_root: Path, epic_id: str | None = None) -> Path:
-    """Copy the lead's handbook and the decisions binding this epic into this checkout."""
+def refresh_context(project_root: Path, epic_id: str | None = None, thread: str | None = None) -> Path:
+    """Copy the lead's handbook, the decisions binding this epic and its thread into this checkout."""
     target = project_root / CONTEXT_DIR
     target.mkdir(parents=True, exist_ok=True)
     root = main_root(project_root)
@@ -178,6 +180,9 @@ def refresh_context(project_root: Path, epic_id: str | None = None) -> Path:
             "# Your assignment\n\nA single feature, outside a planned autopilot run.\n\n" + QUESTION_PROTOCOL,
             encoding="utf-8",
         )
+    if thread:
+        run = os.environ.get("AUTOPILOT_RUN", "").strip()
+        chat.write_thread_context(root, target, thread, thread, chat.run_thread(run) if run else None)
     return target
 
 
@@ -240,6 +245,47 @@ def write_epic_context(root: Path, worktree: Path, state: dict[str, Any], epic_i
     if program.is_file():
         (target / "program.md").write_text(program.read_text(encoding="utf-8"), encoding="utf-8")
     (target / "decisions.md").write_text(render_decisions(decisions_for(root, epic_id)), encoding="utf-8")
+    run = state.get("run_id") or ""
+    if run:
+        chat.write_thread_context(root, target, chat.epic_thread(run, epic_id),
+                                  f"{epic_id} · {epic['title']} (run {run})", chat.run_thread(run))
+
+
+# ── conversation ─────────────────────────────────────────────────────────────
+
+
+def _say(project_root: Path, state: dict[str, Any], author: str, text: str, kind: str, **meta: Any) -> None:
+    """Add to this epic's thread (the team's memory, mirrored to the chat app)."""
+    mention = bool(meta.pop("mention_owner", False))
+    chat.safe_post(main_root(project_root), chat.pipe_thread(state), author, text, kind=kind,
+                   meta={"epic": state.get("epic_id"), **meta}, mention_owner=mention)
+
+
+def _question_text(question: dict[str, Any]) -> str:
+    lines = [f"❓ **{question['id']}**: {question['question']}"]
+    if question.get("context"):
+        lines.append(f"Context: {question['context']}")
+    if question.get("options"):
+        lines.append("Options: " + "; ".join(str(o) for o in question["options"]))
+    if question.get("recommendation"):
+        lines.append(f"My recommendation: {question['recommendation']}")
+    return "\n".join(lines)
+
+
+def _ask_owner(project_root: Path, state: dict[str, Any], question: dict[str, Any], answer: dict[str, Any]) -> None:
+    options = answer.get("options") or question.get("options") or []
+    lines = [f"**Product question {question['id']}** for you: {question['question']}"]
+    if question.get("context"):
+        lines.append(f"Context: {question['context']}")
+    if options:
+        lines.append("Options: " + "; ".join(str(o) for o in options))
+    if answer.get("recommendation"):
+        lines.append(f"I recommend: {answer['recommendation']}")
+    if answer.get("why"):
+        lines.append(f"Why it is yours to decide: {answer['why']}")
+    lines.append(f"Reply in this thread with your decision (or `answer {question['id']} <decision>`). "
+                 "Only this developer waits; the rest of the team carries on.")
+    _say(project_root, state, "lead", "\n".join(lines), "owner-question", question=question["id"], mention_owner=True)
 
 
 # ── questions ────────────────────────────────────────────────────────────────
@@ -255,7 +301,7 @@ def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str,
     """File new questions (inbox + spec markers); answer repeats from the decision log."""
     feature_dir = spec_mod.resolve_feature_dir(project_root)
     state = ensure_pipe(project_root, config, feature_dir)
-    refresh_context(project_root, state.get("epic_id"))
+    refresh_context(project_root, state.get("epic_id"), chat.pipe_thread(state))
     if state["status"] in LOOP_END:
         return {"open": 0, "finished": True, "status": state["status"], "lead_args": ""}
     flush_pending(project_root, config)  # decisions made before tasks.md existed
@@ -317,6 +363,8 @@ def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str,
     }
     questions = load_questions(qdir)
     for question in questions:
+        if question["id"] not in {q["id"] for q in existing}:
+            _say(project_root, state, chat.developer(state), _question_text(question), "question", question=question["id"])
         if question.get("answer") is None:
             decision = decisions.get(_normalise_question(question["question"]))
             if decision:
@@ -324,6 +372,8 @@ def collect(project_root: Path, config: dict[str, Any], stage: str) -> dict[str,
                     "answer": decision["answer"], "rationale": f"Already decided in {decision['id']}.",
                     "decided_by": "decision-log", "decision_id": decision["id"],
                 })
+                _say(project_root, state, "lead", f"{question['id']}: already decided in {decision['id']}: "
+                     f"{decision['answer']}", "answer", question=question["id"], decision=decision["id"])
     questions = load_questions(qdir)
 
     if len(questions) > config["pipe"]["max_questions"]:
@@ -403,16 +453,26 @@ def record(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, 
                 )
             question["applied"] = True
             applied.append(question["id"])
+            if answer.get("decided_by") != "decision-log":
+                who = str(answer.get("decided_by", "lead"))
+                why = f" Why: {answer['rationale']}" if answer.get("rationale") and who != "product owner" else ""
+                _say(project_root, state, "lead" if who == "lead" else "autopilot",
+                     f"✅ **{decision_id}** ({who}) for {question['id']}: {text}{why}", "decision",
+                     question=question["id"], decision=decision_id)
         elif _needs_human(question):
             waiting.append(question)
-            continue
+            if question.get("owner_notified"):
+                continue
+            _ask_owner(project_root, state, question, question["answer"] or {})
+            question["owner_notified"] = True
         else:
             question["lead_attempts"] = question.get("lead_attempts", 0) + 1
             if question["lead_attempts"] >= 2:
-                write_json(qdir / f"{question['id']}.answer.json", {
-                    "needs_human": True, "why": "the team lead did not answer it twice",
-                })
+                why = {"needs_human": True, "why": "the team lead did not answer it twice"}
+                write_json(qdir / f"{question['id']}.answer.json", why)
                 waiting.append(question)
+                _ask_owner(project_root, state, question, why)
+                question["owner_notified"] = True
         stored = {k: v for k, v in question.items() if k != "answer"}
         write_json(qdir / f"{question['id']}.json", stored)
 
@@ -426,7 +486,7 @@ def record(project_root: Path, config: dict[str, Any], stage: str) -> dict[str, 
                      + "; ".join(f"{q['id']}: {q['question']}" for q in waiting))
     save_pipe(project_root, feature_dir, state)
     # The next developer step must already see the decisions just made.
-    refresh_context(project_root, state.get("epic_id"))
+    refresh_context(project_root, state.get("epic_id"), chat.pipe_thread(state))
     return {
         "finished": state["status"] in LOOP_END,
         "status": state["status"],

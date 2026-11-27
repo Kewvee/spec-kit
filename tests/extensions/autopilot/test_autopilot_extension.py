@@ -14,6 +14,7 @@ EXPECTED_COMMANDS = {
     "speckit.autopilot.setup",
     "speckit.autopilot.run",
     "speckit.autopilot.status",
+    "speckit.autopilot.chat",
     "speckit.autopilot.recover",
     "speckit.autopilot.epics",
     "speckit.autopilot.lead",
@@ -119,7 +120,7 @@ def test_core_is_stdlib_only():
     allowed = {
         "__future__", "argparse", "copy", "concurrent", "dataclasses", "datetime", "fnmatch", "hashlib",
         "json", "os", "pathlib", "re", "secrets", "shutil", "signal", "subprocess", "sys", "tempfile", "time",
-        "typing", "fcntl", "msvcrt",  # fcntl / msvcrt: the platform's lock primitive, imported where used
+        "typing", "urllib", "fcntl", "msvcrt",  # fcntl / msvcrt: the platform's lock primitive, imported where used
         "autopilot_core", "yaml",  # yaml: optional, imported inside a try block
     }
     for path in (EXT_DIR / "scripts" / "python").rglob("*.py"):

@@ -28,6 +28,9 @@ provides:
     - name: speckit.autopilot.status
       file: commands/speckit.autopilot.status.md
       description: "Report the run's stage, each epic's progress, and why any epic failed or needs a human (read-only)"
+    - name: speckit.autopilot.chat
+      file: commands/speckit.autopilot.chat.md
+      description: "Connect the team to Slack or Discord (one at a time), switch, disconnect, or check the connection"
     - name: speckit.autopilot.recover
       file: commands/speckit.autopilot.recover.md
       description: "Diagnose failed or escalated epics, fix them with the user's approval, reset them and resume the run"

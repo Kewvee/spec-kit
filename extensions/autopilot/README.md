@@ -28,6 +28,7 @@ Then, in the agent's chat:
 | `speckit.autopilot.setup` | Install the workflows, fill the gate from `AGENTS.md` / CI, prove it green, set limits, commit the setup |
 | `speckit.autopilot.run` | Conductor: preflight, plan, gate 1 in chat, detached unattended drive, gate 2 in chat, land. Re-run to continue; `stop` halts new pipes |
 | `speckit.autopilot.status` | Read-only: stage, epics, budget, recent events, cause of any failure |
+| `speckit.autopilot.chat` | Connect the team to Slack or Discord (one at a time): a thread per epic and per run; approve, answer and steer by replying |
 | `speckit.autopilot.recover` | Diagnose failed or escalated epics, fix with your approval, reset and resume |
 | `speckit.autopilot.epics` | Internal: plan epics into `.specify/autopilot/epics.json` and write the team handbook `program.md` |
 | `speckit.autopilot.lead` | Internal: the team lead answering a developer's questions, or handing product questions to you |

@@ -2,6 +2,28 @@
 
 <!-- insert new changelog below this comment -->
 
+## [1.4.5-autopilot.3] - 2026-11-27
+
+> **Experimental.** Personal fork release. The chat connectors are tested against fake HTTP only. They have not yet run against a live Slack workspace or Discord server.
+
+### Added
+
+- **Team chat** for the autopilot (Slack or Discord, one at a time), per the design in `extensions/autopilot/design/team-chat.md`.
+  - **Team journal.** The team's conversation is stored in `.specify/autopilot/threads/`, one thread per run and per epic, and committed when a run lands. Developers, the lead, the gate and the reviewer append to it without network access. Each developer step reads its epic's thread as `context/thread.md`, including the product owner's notes.
+  - **Bridge.** `autopilot.py chat bridge` is a single background process: it mirrors the journal and scheduler events, delivers in order with live status, and reads replies from the owner's account only. It is the only part of the autopilot that uses the network.
+    - **Owner commands:** gates (`approve|reject plan|land <run-id>`, exact phrase only), answers, `stop`, `resume`, `status`, and free-form notes.
+    - **Safety:** a flood guard folds a backlog into one digest, a replay guard stops a newly connected app from posting history unprompted, and a health file reports problems.
+  - **Connectors** (standard library only):
+    - Slack: thread headers edited in place, speaker names, hidden message metadata, reactions as acknowledgements.
+    - Discord: a forum post per thread, speaker names through a webhook, status as forum tags, archived posts reopened before writing.
+  - **Commands and setup.** `/speckit.autopilot.chat` connects, switches, disconnects and checks. `autopilot.py chat check|bridge|stop|replay|status`. A Slack app manifest ships in `extensions/autopilot/chat/`. `/speckit.autopilot.setup` offers to connect a chat.
+  - **Config and secrets.** A `chat` section in `autopilot-config.yml`. Tokens come from an environment variable or `~/.config/specify/autopilot/<app>-token`, never from the config. Values that look like tokens are rejected.
+- `status` reports the chat connection.
+
+### Fixed
+
+- The fallback config parser read `none` as null; it now matches PyYAML.
+
 ## [1.4.5-autopilot.2] - 2026-11-27
 
 > **Experimental.** Fork pre-release. Autopilot fixes from the automated review of the closed upstream PR (github/spec-kit#5588), and the design for team chat with Slack or Discord (`extensions/autopilot/design/team-chat.md`, not built yet). The new workflow-engine tests were written but not run here (the project's test dependencies were not installed); the rest ran against a minimal pytest stand-in.

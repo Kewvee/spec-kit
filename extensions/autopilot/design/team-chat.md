@@ -1,6 +1,12 @@
 # Design: team chat for the autopilot (Slack or Discord)
 
-Status: **proposed**, 2026-11-27. Experimental, like the rest of the autopilot.
+Status: **implemented** in `v1.4.5-autopilot.3` (experimental). Differences from the proposal:
+
+- **Discord live status uses forum tags only.** The thread's title and first line are not edited, because of Discord's rename limits.
+- **Commands outside a thread work in Slack only.** In Discord, reply in a post.
+- **Plain-text formatting.** Messages are plain Markdown converted per app; no rich blocks or embeds.
+- **Owner settings are machine-local.** The `/speckit.autopilot.chat` skill writes the IDs to `local-config.yml`, so personal IDs stay out of git.
+- **Tested against fakes only.** The connectors' tests run against fake HTTP; neither has been run against a live workspace yet.
 
 ## 1. Goal
 

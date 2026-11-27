@@ -1,0 +1,24 @@
+# Slack app manifest for the spec-kit autopilot's team chat.
+# https://api.slack.com/apps -> Create New App -> From an app manifest -> paste this.
+# Then: Install to Workspace, copy the Bot User OAuth Token (xoxb-...) into
+# ~/.config/specify/autopilot/slack-token (mode 600) or $SLACK_BOT_TOKEN, and
+# invite the bot to the project's channel (/invite @spec-kit autopilot).
+display_information:
+  name: spec-kit autopilot
+  description: Mirrors the autopilot team's threads and takes the product owner's replies.
+features:
+  bot_user:
+    display_name: spec-kit autopilot
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - channels:history
+      - groups:history
+      - reactions:write
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
